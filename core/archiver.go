@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/Masterminds/squirrel"
+	"github.com/navidrome/navidrome/core/storage"
 	"github.com/navidrome/navidrome/core/stream"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
@@ -174,6 +174,20 @@ func (a *archiver) playlistFilename(mf model.MediaFile, format string, idx int) 
 	return fmt.Sprintf("%02d - %s - %s.%s", idx+1, str.SanitizeFilename(mf.Artist), str.SanitizeFilename(mf.Title), ext)
 }
 
+// openLibraryFile opens a media file's raw bytes through its library's storage backend,
+// so zip/download works for non-local (s3://) libraries as well as local (file://) ones.
+func openLibraryFile(ctx context.Context, mf model.MediaFile) (io.ReadCloser, error) {
+	st, err := storage.For(mf.LibraryPath)
+	if err != nil {
+		return nil, err
+	}
+	fsys, err := st.FS()
+	if err != nil {
+		return nil, err
+	}
+	return fsys.Open(mf.Path)
+}
+
 func (a *archiver) addFileToZip(ctx context.Context, z *zip.Writer, mf model.MediaFile, format string, bitrate int, filename string) error {
 	path := mf.AbsolutePath()
 
@@ -185,7 +199,10 @@ func (a *archiver) addFileToZip(ctx context.Context, z *zip.Writer, mf model.Med
 	if format != "raw" && format != "" {
 		r, err = a.ms.NewStream(ctx, &mf, stream.Request{Format: format, BitRate: bitrate})
 	} else {
-		r, err = os.Open(path)
+		// Route the raw read through the library's storage backend so non-local
+		// backends (s3://) work. For local (file://) libraries this resolves to the
+		// on-disk file, preserving the previous os.Open behavior.
+		r, err = openLibraryFile(ctx, mf)
 	}
 	if err != nil {
 		log.Error(ctx, "Error opening file for zipping", "file", path, "format", format, err)

@@ -23,14 +23,28 @@ import (
 
 // TranscodeOptions contains all parameters for a transcoding operation.
 type TranscodeOptions struct {
-	Command    string // DB command template (used to detect custom vs default)
-	Format     string // Target format (mp3, opus, aac, flac)
-	FilePath   string
+	Command  string // DB command template (used to detect custom vs default)
+	Format   string // Target format (mp3, opus, aac, flac)
+	FilePath string
+	// InputURL, when non-empty, is an HTTP(S) URL (e.g. a presigned S3 GET URL) that
+	// ffmpeg fetches directly instead of reading FilePath from disk. This is how
+	// transcoding works for non-local (s3://) libraries, whose objects have no local
+	// path. When empty, ffmpeg reads the local FilePath as before.
+	InputURL   string
 	BitRate    int // kbps, 0 = codec default
 	SampleRate int // 0 = no constraint
 	Channels   int // 0 = no constraint
 	BitDepth   int // 0 = no constraint; valid values: 16, 24, 32
 	Offset     int // seconds
+}
+
+// input returns the ffmpeg input argument: the presigned URL when set, otherwise the
+// local file path. ffmpeg accepts an http(s):// URL anywhere it accepts a path.
+func (o TranscodeOptions) input() string {
+	if o.InputURL != "" {
+		return o.InputURL
+	}
+	return o.FilePath
 }
 
 // AudioProbeResult contains authoritative audio stream properties from ffprobe.
@@ -76,8 +90,13 @@ func (e *ffmpeg) Transcode(ctx context.Context, opts TranscodeOptions) (io.ReadC
 	if _, err := ffmpegCmd(); err != nil {
 		return nil, err
 	}
-	if err := fileExists(opts.FilePath); err != nil {
-		return nil, err
+	// For local libraries the input is a file path that must exist on disk. For non-local
+	// libraries (s3://) the input is a presigned URL fetched over HTTP, so there is no local
+	// file to stat — skip the existence check in that case.
+	if opts.InputURL == "" {
+		if err := fileExists(opts.FilePath); err != nil {
+			return nil, err
+		}
 	}
 	var args []string
 	if isDefaultCommand(opts.Format, opts.Command) {
@@ -125,11 +144,20 @@ func (e *ffmpeg) ExtractImage(ctx context.Context, path string) (io.ReadCloser, 
 	if _, err := ffmpegCmd(); err != nil {
 		return nil, err
 	}
-	if err := fileExists(path); err != nil {
-		return nil, err
+	// A remote (http/https) input has no local file to stat — it is a presigned URL for a
+	// non-local library. ffmpeg fetches it directly. Only stat local paths.
+	if !isRemoteInput(path) {
+		if err := fileExists(path); err != nil {
+			return nil, err
+		}
 	}
 	args := createFFmpegCommand(extractImageCmd, path, 0, 0)
 	return e.start(ctx, args)
+}
+
+// isRemoteInput reports whether the ffmpeg input is an http(s) URL rather than a local path.
+func isRemoteInput(input string) bool {
+	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
 }
 
 func fileExists(path string) error {
@@ -400,7 +428,7 @@ func buildDynamicArgs(opts TranscodeOptions) []string {
 		args = append(args, "-ss", strconv.Itoa(opts.Offset))
 	}
 
-	args = append(args, "-i", opts.FilePath)
+	args = append(args, "-i", opts.input())
 	args = append(args, "-map", "0:a:0")
 
 	if codec, ok := formatCodecMap[opts.Format]; ok {
@@ -428,7 +456,7 @@ func buildDynamicArgs(opts TranscodeOptions) []string {
 // core/stream/codec.go codecMax* helpers), so injecting them unconditionally is safe —
 // ffmpeg honors the last occurrence of a duplicate flag.
 func buildTemplateArgs(opts TranscodeOptions) []string {
-	args := createFFmpegCommand(opts.Command, opts.FilePath, opts.BitRate, opts.Offset)
+	args := createFFmpegCommand(opts.Command, opts.input(), opts.BitRate, opts.Offset)
 	return injectDynamicAudioFlags(args, opts)
 }
 

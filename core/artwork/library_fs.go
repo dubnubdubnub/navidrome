@@ -25,6 +25,25 @@ func (v libraryView) Abs(rel string) string {
 	return filepath.Join(v.absRoot, rel)
 }
 
+// ffmpegInput returns the input ffmpeg should read for the given library-relative path:
+// a presigned HTTP URL when the library's backend supports it (s3://), otherwise the
+// absolute on-disk path (file://). Returns "" for an empty rel so callers can treat it
+// as "no input available" and fall through.
+func (v libraryView) ffmpegInput(ctx context.Context, rel string) string {
+	if rel == "" {
+		return ""
+	}
+	if up, ok := v.FS.(storage.URLProvider); ok {
+		if u, err := up.PresignedURL(ctx, rel); err == nil {
+			return u
+		}
+		// Presigning failed; nothing readable for a remote backend (no local path
+		// exists), so signal "no input" rather than handing ffmpeg a bogus path.
+		return ""
+	}
+	return v.Abs(rel)
+}
+
 // loadLibraryView resolves the MusicFS and absolute root path in a single
 // library lookup.
 func loadLibraryView(ctx context.Context, ds model.DataStore, libID int) (libraryView, error) {

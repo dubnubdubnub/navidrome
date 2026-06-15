@@ -333,6 +333,60 @@ var _ = Describe("ffmpeg", func() {
 		})
 	})
 
+	Describe("ffmpeg input selection (presigned URL vs local path)", func() {
+		It("uses InputURL as the ffmpeg input when set (dynamic args)", func() {
+			args := buildDynamicArgs(TranscodeOptions{
+				Format:   "mp3",
+				FilePath: "/music/file.flac",
+				InputURL: "http://s3.example/music/file.flac?sig=abc",
+				BitRate:  128,
+			})
+			Expect(args).To(ContainElements("-i", "http://s3.example/music/file.flac?sig=abc"))
+			Expect(args).ToNot(ContainElement("/music/file.flac"))
+		})
+
+		It("falls back to the local FilePath when InputURL is empty (dynamic args)", func() {
+			args := buildDynamicArgs(TranscodeOptions{
+				Format:   "mp3",
+				FilePath: "/music/file.flac",
+				BitRate:  128,
+			})
+			Expect(args).To(ContainElements("-i", "/music/file.flac"))
+		})
+
+		It("uses InputURL as the ffmpeg input when set (template args)", func() {
+			args := buildTemplateArgs(TranscodeOptions{
+				Command:  "ffmpeg -i %s -b:a %bk mp3 -",
+				Format:   "mp3",
+				FilePath: "/music/file.mp3",
+				InputURL: "https://s3.example/music/file.mp3?sig=xyz",
+				BitRate:  192,
+			})
+			Expect(args).To(Equal([]string{
+				"ffmpeg", "-i", "https://s3.example/music/file.mp3?sig=xyz", "-b:a", "192k", "mp3", "-",
+			}))
+		})
+
+		It("falls back to the local FilePath when InputURL is empty (template args)", func() {
+			args := buildTemplateArgs(TranscodeOptions{
+				Command:  "ffmpeg -i %s -b:a %bk mp3 -",
+				Format:   "mp3",
+				FilePath: "/music/file.mp3",
+				BitRate:  192,
+			})
+			Expect(args).To(Equal([]string{
+				"ffmpeg", "-i", "/music/file.mp3", "-b:a", "192k", "mp3", "-",
+			}))
+		})
+
+		It("reports remote http(s) inputs and treats local paths as non-remote", func() {
+			Expect(isRemoteInput("http://s3.example/x")).To(BeTrue())
+			Expect(isRemoteInput("https://s3.example/x")).To(BeTrue())
+			Expect(isRemoteInput("/music/file.mp3")).To(BeFalse())
+			Expect(isRemoteInput("C:/music/file.mp3")).To(BeFalse())
+		})
+	})
+
 	Describe("injectBeforeOutput", func() {
 		It("inserts flag before trailing dash", func() {
 			args := injectBeforeOutput([]string{"ffmpeg", "-i", "file.mp3", "-f", "mp3", "-"}, "-ar", "48000")

@@ -142,7 +142,7 @@ func (d *discArtworkReader) fromDiscArtPriority(ctx context.Context, ffmpeg ffmp
 		case pattern == "embedded":
 			ff = append(ff,
 				fromTag(ctx, d.lib.FS, d.firstTrackRel),
-				fromFFmpegTag(ctx, ffmpeg, d.lib.Abs(d.firstTrackRel)),
+				fromFFmpegTag(ctx, ffmpeg, d.lib.ffmpegInput(ctx, d.firstTrackRel)),
 			)
 		case pattern == "external":
 			// Not supported for disc art, silently ignore

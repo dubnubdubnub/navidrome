@@ -15,6 +15,7 @@ import (
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/core/ffmpeg"
+	"github.com/navidrome/navidrome/core/storage"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
@@ -48,6 +49,7 @@ type streamJob struct {
 	ms         *mediaStreamer
 	mf         *model.MediaFile
 	filePath   string
+	inputURL   string // presigned URL for non-local backends; empty for local (file://)
 	format     string
 	bitRate    int
 	sampleRate int
@@ -88,20 +90,35 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 			"requestBitrate", req.BitRate, "requestFormat", req.Format, "requestOffset", req.Offset,
 			"originalBitrate", mf.BitRate, "originalFormat", mf.Suffix,
 			"selectedBitrate", bitRate, "selectedFormat", format)
-		f, err := os.Open(filePath)
+		f, err := openMediaFile(mf)
 		if err != nil {
 			return nil, err
 		}
 		s.ReadCloser = f
-		s.Seeker = f
+		// http.ServeContent needs random access for range requests. Both the local
+		// *os.File and the s3 fs.File satisfy io.ReadSeeker; only set the Seeker when
+		// the opened file actually does, so a non-seekable backend degrades gracefully
+		// instead of panicking inside http.ServeContent.
+		if rs, ok := f.(io.ReadSeeker); ok {
+			s.Seeker = rs
+		}
 		s.format = mf.Suffix
 		return s, nil
+	}
+
+	// For non-local libraries (e.g. s3://) ffmpeg cannot read the file from disk; obtain a
+	// presigned URL to hand it as input. This is best-effort: a local (file://) library has
+	// no URLProvider and inputURL stays empty, so the transcoder falls back to filePath.
+	inputURL, err := presignedInputURL(ctx, mf)
+	if err != nil {
+		return nil, err
 	}
 
 	job := &streamJob{
 		ms:         ms,
 		mf:         mf,
 		filePath:   filePath,
+		inputURL:   inputURL,
 		format:     format,
 		bitRate:    bitRate,
 		sampleRate: req.SampleRate,
@@ -261,6 +278,7 @@ func NewTranscodingCache() TranscodingCache {
 				Command:    command,
 				Format:     job.format,
 				FilePath:   job.filePath,
+				InputURL:   job.inputURL,
 				BitRate:    job.bitRate,
 				SampleRate: job.sampleRate,
 				BitDepth:   job.bitDepth,
@@ -277,6 +295,43 @@ func NewTranscodingCache() TranscodingCache {
 			// ffmpeg has exited (either EOF or context cancellation).
 			return &releasingReadCloser{ReadCloser: out, release: release}, nil
 		})
+}
+
+// openMediaFile opens a media file's raw bytes for streaming. It routes the read through
+// the library's storage backend (storage.For(mf.LibraryPath).FS()) so non-local backends
+// such as s3:// work: the returned fs.File from the s3 backend is a seekable io.ReadSeeker,
+// so http.ServeContent can serve range requests over it unchanged. For local (file://)
+// libraries this resolves to the on-disk file, preserving the previous behavior.
+func openMediaFile(mf *model.MediaFile) (io.ReadCloser, error) {
+	st, err := storage.For(mf.LibraryPath)
+	if err != nil {
+		return nil, err
+	}
+	fsys, err := st.FS()
+	if err != nil {
+		return nil, err
+	}
+	return fsys.Open(mf.Path)
+}
+
+// presignedInputURL returns a presigned HTTP URL for the media file's bytes when the
+// library's storage backend supports it (implements storage.URLProvider, e.g. s3://).
+// For local (file://) libraries the backend does not implement URLProvider and this
+// returns "", nil so the caller falls back to the local file path.
+func presignedInputURL(ctx context.Context, mf *model.MediaFile) (string, error) {
+	st, err := storage.For(mf.LibraryPath)
+	if err != nil {
+		return "", err
+	}
+	fsys, err := st.FS()
+	if err != nil {
+		return "", err
+	}
+	up, ok := fsys.(storage.URLProvider)
+	if !ok {
+		return "", nil
+	}
+	return up.PresignedURL(ctx, mf.Path)
 }
 
 // userName extracts the username from the context for logging purposes.

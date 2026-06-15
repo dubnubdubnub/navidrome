@@ -68,7 +68,7 @@ func (a *mediafileArtworkReader) Reader(ctx context.Context) (io.ReadCloser, str
 	if a.mediafile.CoverArtID().Kind == model.KindMediaFileArtwork {
 		ff = []sourceFunc{
 			fromTag(ctx, a.lib.FS, a.mediafile.Path),
-			fromFFmpegTag(ctx, a.a.ffmpeg, a.lib.Abs(a.mediafile.Path)),
+			fromFFmpegTag(ctx, a.a.ffmpeg, a.lib.ffmpegInput(ctx, a.mediafile.Path)),
 		}
 	}
 	// For multi-disc albums, fall back to disc artwork first; for single-disc albums,
