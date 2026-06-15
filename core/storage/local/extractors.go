@@ -27,3 +27,18 @@ func RegisterExtractor(id string, f extractorConstructor) {
 	defer lock.Unlock()
 	extractors[id] = f
 }
+
+// Extractor is constructed from an fs.FS and a base directory. Renamed type alias kept
+// here so other storage backends (e.g. s3) can build the same extractors against their
+// own fs.FS implementation.
+type ExtractorConstructor = extractorConstructor
+
+// GetExtractor returns the registered extractor constructor for the given id. The
+// boolean is false if no extractor is registered under that id. This lets non-local
+// storage backends reuse the same tag extractors (e.g. gotaglib) against their fs.FS.
+func GetExtractor(id string) (ExtractorConstructor, bool) {
+	lock.RLock()
+	defer lock.RUnlock()
+	f, ok := extractors[id]
+	return f, ok
+}

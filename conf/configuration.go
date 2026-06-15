@@ -119,6 +119,7 @@ type configOptions struct {
 	EnableScrobbleHistory           bool
 	Tags                            map[string]TagConf `json:",omitempty"`
 	Agents                          string
+	S3                              s3Options          `json:",omitzero"`
 
 	// DevFlags. These are used to enable/disable debugging and incomplete features
 	DevLogLevels                      map[string]string `json:",omitempty"`
@@ -163,6 +164,18 @@ type scannerOptions struct {
 	GroupAlbumReleases bool   // Deprecated: Use PID.Album instead
 	FollowSymlinks     bool   // Whether to follow symlinks when scanning directories
 	PurgeMissing       string // Values: "never", "always", "full"
+}
+
+// s3Options configures the native s3:// storage backend (e.g. against Garage or AWS S3).
+// These can also be supplied via environment variables (ND_S3_ENDPOINT, ND_S3_REGION, etc.)
+// or, for credentials, the standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY variables.
+type s3Options struct {
+	Endpoint  string // e.g. "http://10.1.1.5:3900" or "s3.amazonaws.com"
+	Region    string // e.g. "garage" or "us-east-1"
+	AccessKey string
+	SecretKey string //nolint:gosec
+	PathStyle bool   // use path-style addressing (required for Garage/MinIO)
+	UseSSL    bool   // whether to use https; inferred from Endpoint scheme if it has one
 }
 
 type transcodingOptions struct {
@@ -822,6 +835,12 @@ func setViperDefaults() {
 	viper.SetDefault("scanner.groupalbumreleases", false)
 	viper.SetDefault("scanner.followsymlinks", true)
 	viper.SetDefault("scanner.purgemissing", consts.PurgeMissingNever)
+	viper.SetDefault("s3.endpoint", "")
+	viper.SetDefault("s3.region", "")
+	viper.SetDefault("s3.accesskey", "")
+	viper.SetDefault("s3.secretkey", "")
+	viper.SetDefault("s3.pathstyle", false)
+	viper.SetDefault("s3.usessl", false)
 	viper.SetDefault("subsonic.appendsubtitle", true)
 	viper.SetDefault("subsonic.appendalbumversion", true)
 	viper.SetDefault("subsonic.artistparticipations", false)
