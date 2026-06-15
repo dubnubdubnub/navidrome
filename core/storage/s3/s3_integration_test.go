@@ -1,7 +1,10 @@
 package s3_test
 
 import (
+	"context"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path"
 	"sort"
@@ -138,6 +141,93 @@ func TestS3Integration(t *testing.T) {
 	if withPicture == 0 && len(coverFiles) == 0 {
 		t.Errorf("expected some embedded artwork or cover.* files; found neither")
 	}
+}
+
+// TestS3PresignedURL verifies that the s3 backend implements storage.URLProvider and that
+// the presigned GET URL it produces is fetchable over plain HTTP with a Range request — this
+// is exactly what the ffmpeg transcoding path relies on for s3:// libraries. Skipped unless
+// ND_S3_ENDPOINT is set.
+func TestS3PresignedURL(t *testing.T) {
+	if os.Getenv("ND_S3_ENDPOINT") == "" {
+		t.Skip("ND_S3_ENDPOINT not set; skipping S3 presigned-URL test")
+	}
+	conf.Server.Scanner.Extractor = "taglib"
+
+	bucket := os.Getenv("ND_S3_BUCKET")
+	if bucket == "" {
+		bucket = "music"
+	}
+
+	st, err := storage.For("s3://" + bucket)
+	if err != nil {
+		t.Fatalf("storage.For: %v", err)
+	}
+	musicFS, err := st.FS()
+	if err != nil {
+		t.Fatalf("FS(): %v", err)
+	}
+
+	up, ok := musicFS.(storage.URLProvider)
+	if !ok {
+		t.Fatal("s3 MusicFS does not implement storage.URLProvider")
+	}
+
+	// Find one audio object to presign.
+	var track string
+	err = fs.WalkDir(musicFS, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		lower := strings.ToLower(p)
+		if strings.HasSuffix(lower, ".flac") || strings.HasSuffix(lower, ".mp3") ||
+			strings.HasSuffix(lower, ".m4a") || strings.HasSuffix(lower, ".ogg") {
+			track = p
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir: %v", err)
+	}
+	if track == "" {
+		t.Fatal("no audio file found in bucket to presign")
+	}
+
+	ctx := context.Background()
+	url, err := up.PresignedURL(ctx, track)
+	if err != nil {
+		t.Fatalf("PresignedURL(%q): %v", track, err)
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		t.Fatalf("expected http(s) presigned URL, got %q", url)
+	}
+	t.Logf("PRESIGNED URL for %q:\n  %s", track, url)
+
+	// HTTP GET the first 16 bytes via a Range request, mirroring how ffmpeg reads the input.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Range", "bytes=0-15")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET presigned URL: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status fetching presigned URL: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		t.Fatalf("reading presigned URL body: %v", err)
+	}
+	if len(body) == 0 {
+		t.Fatal("presigned URL returned no data")
+	}
+	t.Logf("RANGE GET status=%s, read %d bytes (first bytes: % x)", resp.Status, len(body), body[:min(len(body), 8)])
 }
 
 func isCoverName(base string) bool {
