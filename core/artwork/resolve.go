@@ -513,7 +513,7 @@ func resolveEmbedded(ctx context.Context, lib libraryView, ffm ffmpeg.FFmpeg, em
 	}
 	abs := lib.Abs(embedRel)
 	var unreadable bool
-	for _, sf := range []sourceFunc{fromTag(ctx, lib.FS, embedRel), fromFFmpegTag(ctx, ffm, abs)} {
+	for _, sf := range []sourceFunc{fromTag(ctx, lib.FS, embedRel), fromFFmpegTag(ctx, ffm, lib.ffmpegInput(ctx, embedRel))} {
 		r, _, err := sf()
 		if r != nil {
 			return resolution{reader: r, source: "embedded", sourcePath: abs, refMtime: mtimeViaFS(lib.FS, embedRel)}, true

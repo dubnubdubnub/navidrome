@@ -188,9 +188,10 @@ type s3FS struct {
 }
 
 var (
-	_ storage.MusicFS = (*s3FS)(nil)
-	_ fs.ReadDirFS    = (*s3FS)(nil)
-	_ fs.StatFS       = (*s3FS)(nil)
+	_ storage.MusicFS     = (*s3FS)(nil)
+	_ fs.ReadDirFS        = (*s3FS)(nil)
+	_ fs.StatFS           = (*s3FS)(nil)
+	_ storage.URLProvider = (*s3FS)(nil)
 )
 
 func (sfs *s3FS) ReadTags(paths ...string) (map[string]metadata.Info, error) {
@@ -221,6 +222,26 @@ func (w s3FileInfoWrapper) BirthTime() time.Time {
 }
 
 func (sfs *s3FS) ctx() context.Context { return context.Background() }
+
+// presignedURLExpiry is how long a presigned GET URL stays valid. It needs to comfortably
+// outlast a single transcode/stream of one track, but be short enough that a leaked URL is
+// of limited use.
+const presignedURLExpiry = 6 * time.Hour
+
+// PresignedURL implements storage.URLProvider. It returns a time-limited HTTP(S) URL that
+// grants read access to the object at the given library-relative path, suitable for handing
+// to ffmpeg as an input. This is what lets transcoding work against an s3:// library without
+// a local file: ffmpeg fetches the object directly over HTTP via ranged GETs.
+func (sfs *s3FS) PresignedURL(ctx context.Context, name string) (string, error) {
+	if !fs.ValidPath(name) {
+		return "", &fs.PathError{Op: "presign", Path: name, Err: fs.ErrInvalid}
+	}
+	u, err := sfs.client.PresignedGetObject(ctx, sfs.bucket, name, presignedURLExpiry, url.Values{})
+	if err != nil {
+		return "", fmt.Errorf("s3: presigning %s: %w", name, err)
+	}
+	return u.String(), nil
+}
 
 func init() {
 	storage.Register("s3", newS3Storage)
