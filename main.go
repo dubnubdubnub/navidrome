@@ -5,6 +5,7 @@ import (
 
 	"github.com/navidrome/navidrome/cmd"
 	"github.com/navidrome/navidrome/conf/buildtags"
+	_ "github.com/navidrome/navidrome/core/storage/s3" // Register native s3:// storage backend
 )
 
 //goland:noinspection GoBoolExpressions
