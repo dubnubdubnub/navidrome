@@ -1,0 +1,11 @@
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN mkdir -p ui/build && printf '<!doctype html>stub' > ui/build/index.html
+RUN CGO_ENABLED=1 go build -tags=netgo,sqlite_fts5 -o /out/navidrome .
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/navidrome /usr/bin/navidrome
+EXPOSE 4533
+ENTRYPOINT ["/usr/bin/navidrome"]
