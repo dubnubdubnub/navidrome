@@ -1,0 +1,11 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: navidrome }
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: navidrome
+      port: { number: 4533 }
+  tls:
+    - hosts: [navidrome]
