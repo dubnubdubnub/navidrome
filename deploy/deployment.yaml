@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: navidrome }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: navidrome } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: navidrome } }
+    spec:
+      imagePullSecrets:
+        - { name: ghcr-pull }
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: NotIn, values: [mauler-vm, lima-m4air-vm] }
+      containers:
+        - name: navidrome
+          image: ghcr.io/dubnubdubnub/navidrome-s3 # tag set by kustomize (CI write-back)
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 4533 }]
+          envFrom:
+            - configMapRef: { name: navidrome-config }
+          env:
+            - { name: ND_S3_ACCESSKEY, valueFrom: { secretKeyRef: { name: music-s3, key: ACCESS_KEY } } }
+            - { name: ND_S3_SECRETKEY, valueFrom: { secretKeyRef: { name: music-s3, key: SECRET_KEY } } }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: navidrome-data }

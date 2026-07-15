@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: navidrome-config }
+data:
+  ND_ADDRESS: 0.0.0.0
+  ND_DATAFOLDER: /data
+  ND_IMAGECACHESIZE: 500MB
+  ND_LOGLEVEL: info
+  ND_MUSICFOLDER: s3://music
+  ND_PORT: "4533"
+  ND_S3_ENDPOINT: http://10.1.1.5:3900
+  ND_S3_PATHSTYLE: "true"
+  ND_S3_REGION: garage
+  ND_SCANSCHEDULE: 0 4 * * *
