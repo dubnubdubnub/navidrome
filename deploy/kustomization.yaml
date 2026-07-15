@@ -10,4 +10,4 @@ resources:
 images:
 - name: ghcr.io/dubnubdubnub/navidrome-s3
   newName: ghcr.io/dubnubdubnub/navidrome-s3
-  newTag: placeholder
+  newTag: 01e37e3996d1fbc7fdc4c789182599bdb5f531a3
