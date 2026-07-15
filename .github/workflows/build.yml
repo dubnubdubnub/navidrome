@@ -1,0 +1,42 @@
+name: build
+on:
+  push:
+    branches: ["feat/s3-streaming"]
+    paths-ignore: ["deploy/**"] # the write-back commit must not re-trigger the build
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/dubnubdubnub/navidrome-s3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to commit the deploy/ tag write-back
+      packages: write # to push to GHCR with the ephemeral GITHUB_TOKEN
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.s3
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Write image tag into deploy/ and commit back
+        run: |
+          curl -sL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz | tar xz
+          (cd deploy && ../kustomize edit set image ${{ env.IMAGE }}=${{ env.IMAGE }}:${{ github.sha }})
+          git config user.name "ci-bot"
+          git config user.email "ci@dubnubdubnub"
+          git add deploy/kustomization.yaml
+          git commit -m "ci: deploy ${{ github.sha }} [skip ci]" || { echo "no deploy change"; exit 0; }
+          git push
