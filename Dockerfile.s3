@@ -1,9 +1,25 @@
+########################################################################################################################
+### Build the Navidrome React UI (embedded into the Go binary via ui/embed.go).
+### Mirrors the UI stage of the upstream Dockerfile; pinned to Node 24 per .nvmrc.
+FROM node:24-bookworm AS ui
+WORKDIR /app
+COPY ui/package.json ui/package-lock.json ./
+COPY ui/bin/ ./bin/
+RUN npm ci
+COPY ui/ ./
+RUN npm run build -- --outDir=/build
+
+########################################################################################################################
+### Build the Navidrome server binary with the real UI embedded.
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN mkdir -p ui/build && printf '<!doctype html>stub' > ui/build/index.html
+# Overlay the built SPA so //go:embed build/* picks it up instead of the old stub.
+COPY --from=ui /build ./ui/build
 RUN CGO_ENABLED=1 go build -tags=netgo,sqlite_fts5 -o /out/navidrome .
 
+########################################################################################################################
+### Final runtime image.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/navidrome /usr/bin/navidrome
