@@ -8,9 +8,10 @@ data:
   ND_LOGLEVEL: info
   ND_MUSICFOLDER: s3://music
   ND_PORT: "4533"
-  # Repointed 10.1.1.5 (NAS, offline) -> 10.1.1.2 (blhx370 Garage zone, has full replica).
-  # INTERIM: to be replaced by the garage-s3 HA proxy Service (health-checked failover).
-  ND_S3_ENDPOINT: http://10.1.1.2:3900
+  # Garage HA endpoint: HAProxy DaemonSet (garage-proxy) on the control-plane nodes,
+  # health-checking each Garage node — never a node IP (a node IP is a SPOF, cf. the
+  # 2026-07-27 NAS outage that took streaming down). Off-cluster/DR consumers use a node IP.
+  ND_S3_ENDPOINT: http://garage.garage.svc.cluster.local:3900
   ND_S3_PATHSTYLE: "true"
   ND_S3_REGION: garage
   ND_SCANSCHEDULE: 0 4 * * *
