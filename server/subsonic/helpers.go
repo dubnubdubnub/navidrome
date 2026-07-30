@@ -53,13 +53,17 @@ func (e subError) Unwrap() error {
 }
 
 func (e subError) Error() string {
-	var msg string
-	if len(e.messages) == 0 {
-		msg = responses.ErrorMsg(e.code)
-	} else {
-		msg = fmt.Sprintf(e.messages[0].(string), e.messages[1:]...)
+	switch len(e.messages) {
+	case 0:
+		return responses.ErrorMsg(e.code)
+	case 1:
+		// A single, already-formatted message: return it verbatim. Running it back
+		// through Sprintf with no args mangles any '%' it contains (e.g. a URL-encoded
+		// S3 object key in a stream.view failure) into "%!x(MISSING)".
+		return fmt.Sprint(e.messages[0])
+	default:
+		return fmt.Sprintf(e.messages[0].(string), e.messages[1:]...)
 	}
-	return msg
 }
 
 func getUser(ctx context.Context) model.User {
