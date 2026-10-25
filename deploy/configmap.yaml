@@ -44,9 +44,11 @@ data:
   # scan that detects changes -- scanner/scanner.go runs runRefreshStats and runUpdateLibraries
   # in the same final step regardless of fullScan, and RefreshStats(false) selects artists with
   # updated_at > the previous last_scan_at, so the 23:59:07Z startup scan covered them. The
-  # observation may simply predate that scan finishing. What is not in doubt: song-level
+  # observation is also undated, and the supported reading is that it was taken DURING the
+  # 4m27s startup scan, not after it: every getArtists error-70 response from that client falls
+  # between 23:54:46Z and 23:56:36Z, inside the scan window. What is not in doubt: song-level
   # serving was healthy at 00:00:19Z, and `0 4 * * *` -- which is also a non-full scan,
-  # cmd/root.go AddJobFunc(s.ScanAll(ctx,false)) -- does the same aggregation, so a periodic
+  # cmd/root.go:156 schedulerInstance.Add(schedule, func(){ s.ScanAll(ctx,false) }) -- does the same aggregation, so a periodic
   # scan would have restored both serving and browsing unattended inside ~4h.
   #
   # What the alerting did, for the 00:18-00:22Z zone loss. Four earlier drafts of this note
@@ -65,9 +67,11 @@ data:
   # state need 5m-1h, so a sub-5-minute zone loss surfaces only as node- and survivor-level
   # alerts that clear themselves as soon as the zone returns -- here the two criticals above
   # plus FleetNodeStale{node="mauler"} (warning, no `for:`, firing 00:22-00:24Z to Discord on
-  # the default route). Nothing leaves a durable NOTIFICATION record: Alertmanager keeps no
-  # archive of resolved alerts, so once the ALERTS series age out of the 15d retention window
-  # there is no queryable trace that anyone was told. The raw signals do survive -- up-bits,
+  # the default route). Nothing leaves a durable IN-CLUSTER notification record: Alertmanager
+  # keeps no archive of resolved alerts, so once the ALERTS series age out of the 15d retention
+  # window nothing in the cluster shows that anyone was told. Outside it, the discord receiver
+  # has send_resolved: true, so the firing and resolved posts for these alerts are still in the
+  # Discord channel. The raw signals do survive -- up-bits,
   # ALERTS pending and firing, the kube_pod_status_ready flip, and the guest's hv_utils line
   # in the Loki journal -- which is exactly how this paragraph was re-derived five times.
   #
