@@ -24,34 +24,51 @@ data:
   # So prod ran with NO periodic scan for as long as this file has existed. That is what
   # made the 2026-10-22 Garage outage expensive. The 00:21Z startup scan hit `connection
   # refused` on the endpoint above (Garage was down 00:18-00:22Z: mauler-vm's zone went with
-  # the Hyper-V host that was restarted, and r2d2 was already dead, so 2 of 3 zones were
-  # gone), bailed with "Scanner: Duplicate DirEntry failure", and recorded the library as
-  # scanned-and-empty. Nothing re-scanned it for 2d23h. Recovery came from a rollout restart
-  # at 2026-10-24 23:54:34Z: that pod's startup scan imported all 8,697 tracks by 23:59:07Z,
-  # but albums and artists still did not list (the library row carried total_songs=0 /
-  # total_albums=0), and it was a manual `navidrome scan --full` finishing at 00:06:52Z that
-  # made the library listable. With `0 4 * * *` live, the 04:00Z scan would have healed it
-  # inside ~4h on its own.
+  # the Hyper-V host restarted from the Start Menu, and r2d2 was already dead, so only
+  # blhx370 survived), bailed with "Scanner: Duplicate DirEntry failure", and recorded the
+  # library as scanned-and-empty. Nothing re-scanned it for 2d23h.
   #
-  # What the alerting actually did, read off ALERTS with alertstate preserved. An earlier
-  # version of this note got this wrong twice, so verify rather than repeat it:
-  #   GarageSurvivorUnavailable     FIRED 00:22-00:23Z, two samples. Critical, on the
-  #                                   NEVER_SILENCE list: the only alert that paged anyone
-  #                                   about the zone loss, and it self-cleared on recovery.
-  #   GarageQuorumLost              pending 00:19-00:22Z, NEVER fired (`for: 5m` > 4-min gap)
-  #   GarageSurvivingZoneScrapeDown pending 00:19-00:22Z, NEVER fired (same)
-  #   GarageClusterUnhealthy        firing 24/7 (r2d2 dark since 2026-07-27), SILENCED
-  #   GaragePartitionsDegraded      firing 24/7, SILENCED
-  #   MusicChecksStale              pending 01:01Z, firing 01:16Z -> 2026-10-25 00:00Z
-  #                                   (~71h), unsilenced, Discord, 24h repeat, unremediated
-  # The silences live in dubnubdubnub/infra monitoring/silences.yaml and match
-  # GarageClusterUnhealthy / GaragePartitionsDegraded for zone=blhx370 AND zone=mauler-vm,
-  # i.e. both survivors, so those two could never have notified anybody.
+  # Recovery, in the order the evidence puts it:
+  #   2026-10-24 23:54:34Z  rollout restart
+  #   23:54:40 -> 23:59:07Z  that pod's startup scan (fullScan=false) imported all 8,697
+  #                          tracks (per-folder tracksImported sums to 8697)
+  #   2026-10-25 00:00:19Z   checks-music passed -- getRandomSongs plus a raw and an opus
+  #                          stream, both ffprobe-decoded. Song-level content and Garage
+  #                          streaming were healthy 72s after the startup scan finished, and
+  #                          this is what cleared MusicChecksStale.
+  #   00:06:52Z              a manual `navidrome scan --full` finished. Album and artist
+  #                          listings were still empty before it (getArtists count 0,
+  #                          getAlbumList2 empty, library row total_songs=0/total_albums=0 --
+  #                  observed at the time, not independently recorded) and it completed the
+  #                          aggregation.
+  # So the startup scan restored serving; the full scan restored browsing. `0 4 * * *` live
+  # would have done both unattended inside ~4h.
   #
-  # Two separate open items follow, and neither is "add another rule": the 71-hour
-  # MusicChecksStale tail was a response failure on an alert that behaved correctly, and the
-  # rules actually written to name a zone loss cannot fire under 5 minutes -- the only thing
-  # that can is a ~2-minute critical that clears itself.
+  # What the alerting did, for the 00:18-00:22Z zone loss. Four earlier drafts of this note
+  # were wrong, twice about which alerts fired; re-derive rather than trusting any of it.
+  # Fired, unsilenced, both critical, both self-clearing on recovery:
+  #   GarageSurvivorUnavailable      for=1m  pending 00:21, firing 00:22-00:23Z (2 samples)
+  #   ExternalTargetDown{10.1.1.11:9199} for=2m  pending 00:20-00:21, firing 00:22-00:23Z
+  # Did not fire:
+  #   GarageQuorumLost               for=5m  pending 00:19-00:22Z only
+  #   GarageSurvivingZoneScrapeDown  for=5m  pending 00:19-00:22Z only
+  # Fired but irrelevant -- 24/7 since r2d2 died and silenced for zone=blhx370 AND
+  # zone=mauler-vm in dubnubdubnub/infra monitoring/silences.yaml, so they cannot notify
+  # anybody; generic TargetDown{job="garage"} is silenced too:
+  #   GarageClusterUnhealthy         for=5m      GaragePartitionsDegraded  for=1h
+  # The narrow real gap, stated precisely: the rules that describe Garage quorum or partition
+  # state need 5m-1h, so a sub-5-minute zone loss is visible only through node- and
+  # survivor-level criticals that clear themselves as soon as the zone returns. Nothing
+  # leaves a durable record that a zone was lost for four minutes.
+  #
+  # The three-day tail was a different failure and the one that hurt: MusicChecksStale
+  # (severity=warning, for=15m, unsilenced, Discord on a 24h repeat) went pending 01:01Z and
+  # fired from 01:16Z until the 2026-10-25 00:00:19Z pass -- about 71h. It behaved perfectly
+  # and nobody acted. That is a response failure, not a rule gap.
+  #
+  # Re-deriving this: query ALERTS with alertstate preserved on prometheus-0. Both replicas
+  # hold ALERTS series for the window, but prometheus-1 runs on mauler-vm and its container
+  # restarted at 00:22:43Z, and the two zone-loss alerts above appear only on prometheus-0.
   #
   # A configmap change alone does not restart this pod; see the revision annotation in
   # deployment.yaml.
