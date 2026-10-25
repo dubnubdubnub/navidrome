@@ -14,4 +14,14 @@ data:
   ND_S3_ENDPOINT: http://garage.garage.svc.cluster.local:3900
   ND_S3_PATHSTYLE: "true"
   ND_S3_REGION: garage
-  ND_SCANSCHEDULE: 0 4 * * *
+  # NOT `ND_SCANSCHEDULE`. The config key is `scanner.schedule`, and viper resolves it as
+  # ND_ + key with '.' -> '_' (conf/configuration.go: SetEnvPrefix("ND") + SetEnvKeyReplacer),
+  # so the env var is ND_SCANNER_SCHEDULE. There is no back-compat alias for the old name:
+  # it is silently ignored, `scanner.schedule` keeps its "0" default, validateScanSchedule()
+  # normalises "0" -> "", and schedulePeriodicScan() (cmd/root.go) logs
+  # "Periodic scan is DISABLED" and returns. Prod therefore ran with NO periodic scan since
+  # this file was written; after the 2026-10-22 00:18-00:22Z Garage outage took out the
+  # startup scan (0 files, 0 folders), nothing ever re-indexed and the Subsonic API served
+  # an empty library for 2 days despite 8,697 tracks in the bucket.
+  # NOTE: a configmap change alone does not restart the pod — roll the deployment after sync.
+  ND_SCANNER_SCHEDULE: 0 4 * * *
