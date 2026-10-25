@@ -11,17 +11,22 @@ spec:
       annotations:
         # Bump this whenever deploy/configmap.yaml changes.
         #
-        # Argo CD deploys this app with `selfHeal: true`, and the pod reads every
-        # setting through `envFrom: configMapRef: navidrome-config`. Editing the
-        # ConfigMap does not change this pod template, so Argo syncs the ConfigMap and
-        # leaves the running pod untouched -- the new settings never take effect. The
-        # reflex manual fix, `kubectl rollout restart deployment/navidrome`, is worse:
-        # the `restartedAt` annotation is a live edit to a Git-owned field, so selfHeal
-        # reverts it and rolls the pod back to the OLD environment.
+        # The pod reads every setting through `envFrom: configMapRef: navidrome-config`,
+        # and envFrom is resolved when the pod is created. Editing the ConfigMap leaves
+        # this pod template byte-identical, so Argo CD syncs the ConfigMap and never
+        # restarts the pod: the new settings sit inert until something else happens to
+        # recycle it, and there is no config reloader in the cluster to do it.
         #
-        # The rollout therefore has to be driven from Git. Changing this annotation
-        # changes the pod template, which makes Argo itself perform the update.
-        # `strategy: Recreate` means one brief downtime (1 replica, RWO PVC).
+        # `kubectl rollout restart` does work, and is NOT reverted -- verified 2026-10-25:
+        # the `restartedAt` annotation it writes was still on the live pod template 17h
+        # later with the app Synced/Healthy, selfHeal not treating that live-only
+        # annotation as drift. It is still the wrong tool: it leaves the running pod
+        # differing from anything in Git, and nobody can tell from the manifest when or
+        # why a config change actually took effect.
+        #
+        # So drive the rollout from Git. Changing this annotation changes the pod
+        # template, which makes Argo itself perform the update. `strategy: Recreate`
+        # means one brief downtime (1 replica, RWO PVC; Longhorn re-attaches cross-node).
         #
         # 2 = ND_SCANSCHEDULE -> ND_SCANNER_SCHEDULE (PR #1, 2026-10-25). That key was
         # never read by this Navidrome version, so `Periodic scan is DISABLED` was logged

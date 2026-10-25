@@ -19,9 +19,24 @@ data:
   # so the env var is ND_SCANNER_SCHEDULE. There is no back-compat alias for the old name:
   # it is silently ignored, `scanner.schedule` keeps its "0" default, validateScanSchedule()
   # normalises "0" -> "", and schedulePeriodicScan() (cmd/root.go) logs
-  # "Periodic scan is DISABLED" and returns. Prod therefore ran with NO periodic scan since
-  # this file was written; after the 2026-10-22 00:18-00:22Z Garage outage took out the
-  # startup scan (0 files, 0 folders), nothing ever re-indexed and the Subsonic API served
-  # an empty library for 2 days despite 8,697 tracks in the bucket.
-  # NOTE: a configmap change alone does not restart the pod — roll the deployment after sync.
+  # "Periodic scan is DISABLED" and returns.
+  #
+  # So prod ran with NO periodic scan for as long as this file has existed. That is what
+  # made the 2026-10-22 Garage blip expensive. The 00:21Z startup scan hit `connection
+  # refused` on the endpoint above (Garage was down 00:18-00:22Z: mauler-vm's zone went
+  # with the Hyper-V host that was restarted, and r2d2 was already dead, so 2 of 3 zones
+  # were gone), bailed with "Scanner: Duplicate DirEntry failure", and recorded the
+  # library as scanned-and-empty. With `0 4 * * *` live, the 04:00Z scan would have
+  # healed it inside ~4h. Instead the Subsonic API served an empty library for 2d23h
+  # (2026-10-22 00:21Z -> 2026-10-24 23:54Z), until a manual `navidrome scan --full`
+  # re-indexed the 8,697 tracks that were in the bucket the whole time.
+  #
+  # Detection was NOT the gap, so do not go looking for a missing alert: GarageQuorumLost,
+  # GarageSurvivingZoneScrapeDown, GarageClusterUnhealthy and GaragePartitionsDegraded all
+  # fired at 00:20-00:25Z, and MusicChecksStale fired for all 283 samples of the 3-day
+  # window. It is severity=warning and nobody acted on it. The open problem is response,
+  # not coverage -- see monitoring/rules/synthetic-checks-rules.yaml in dubnubdubnub/infra.
+  #
+  # A configmap change alone does not restart this pod; see the revision annotation in
+  # deployment.yaml.
   ND_SCANNER_SCHEDULE: 0 4 * * *
