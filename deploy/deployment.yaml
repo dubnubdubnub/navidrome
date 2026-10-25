@@ -6,7 +6,27 @@ spec:
   selector: { matchLabels: { app: navidrome } }
   strategy: { type: Recreate }
   template:
-    metadata: { labels: { app: navidrome } }
+    metadata:
+      labels: { app: navidrome }
+      annotations:
+        # Bump this whenever deploy/configmap.yaml changes.
+        #
+        # Argo CD deploys this app with `selfHeal: true`, and the pod reads every
+        # setting through `envFrom: configMapRef: navidrome-config`. Editing the
+        # ConfigMap does not change this pod template, so Argo syncs the ConfigMap and
+        # leaves the running pod untouched -- the new settings never take effect. The
+        # reflex manual fix, `kubectl rollout restart deployment/navidrome`, is worse:
+        # the `restartedAt` annotation is a live edit to a Git-owned field, so selfHeal
+        # reverts it and rolls the pod back to the OLD environment.
+        #
+        # The rollout therefore has to be driven from Git. Changing this annotation
+        # changes the pod template, which makes Argo itself perform the update.
+        # `strategy: Recreate` means one brief downtime (1 replica, RWO PVC).
+        #
+        # 2 = ND_SCANSCHEDULE -> ND_SCANNER_SCHEDULE (PR #1, 2026-10-25). That key was
+        # never read by this Navidrome version, so `Periodic scan is DISABLED` was logged
+        # at every boot and the library only ever scanned on startup.
+        config.navidrome.dubnubdubnub.com/revision: "2"
     spec:
       imagePullSecrets:
         - { name: ghcr-pull }
