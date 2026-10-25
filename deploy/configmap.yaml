@@ -36,13 +36,18 @@ data:
   #                          stream, both ffprobe-decoded. Song-level content and Garage
   #                          streaming were healthy 72s after the startup scan finished, and
   #                          this is what cleared MusicChecksStale.
-  #   00:06:52Z              a manual `navidrome scan --full` finished. Album and artist
-  #                          listings were still empty before it (getArtists count 0,
-  #                          getAlbumList2 empty, library row total_songs=0/total_albums=0 --
-  #                  observed at the time, not independently recorded) and it completed the
-  #                          aggregation.
-  # So the startup scan restored serving; the full scan restored browsing. `0 4 * * *` live
-  # would have done both unattended inside ~4h.
+  #   00:06:52Z              a manual `navidrome scan --full` finished; browsing worked
+  #                          afterwards.
+  # Attribution of "browsing came back" is UNRESOLVED and this note no longer assigns it. The
+  # operator saw getArtists count 0 / getAlbumList2 empty / library row total_songs=0 after the
+  # startup scan, but the deployed code refreshes artist and library stats at the end of EVERY
+  # scan that detects changes -- scanner/scanner.go runs runRefreshStats and runUpdateLibraries
+  # in the same final step regardless of fullScan, and RefreshStats(false) selects artists with
+  # updated_at > the previous last_scan_at, so the 23:59:07Z startup scan covered them. The
+  # observation may simply predate that scan finishing. What is not in doubt: song-level
+  # serving was healthy at 00:00:19Z, and `0 4 * * *` -- which is also a non-full scan,
+  # cmd/root.go AddJobFunc(s.ScanAll(ctx,false)) -- does the same aggregation, so a periodic
+  # scan would have restored both serving and browsing unattended inside ~4h.
   #
   # What the alerting did, for the 00:18-00:22Z zone loss. Four earlier drafts of this note
   # were wrong, twice about which alerts fired; re-derive rather than trusting any of it.
@@ -57,9 +62,14 @@ data:
   # anybody; generic TargetDown{job="garage"} is silenced too:
   #   GarageClusterUnhealthy         for=5m      GaragePartitionsDegraded  for=1h
   # The narrow real gap, stated precisely: the rules that describe Garage quorum or partition
-  # state need 5m-1h, so a sub-5-minute zone loss is visible only through node- and
-  # survivor-level criticals that clear themselves as soon as the zone returns. Nothing
-  # leaves a durable record that a zone was lost for four minutes.
+  # state need 5m-1h, so a sub-5-minute zone loss surfaces only as node- and survivor-level
+  # alerts that clear themselves as soon as the zone returns -- here the two criticals above
+  # plus FleetNodeStale{node="mauler"} (warning, no `for:`, firing 00:22-00:24Z to Discord on
+  # the default route). Nothing leaves a durable NOTIFICATION record: Alertmanager keeps no
+  # archive of resolved alerts, so once the ALERTS series age out of the 15d retention window
+  # there is no queryable trace that anyone was told. The raw signals do survive -- up-bits,
+  # ALERTS pending and firing, the kube_pod_status_ready flip, and the guest's hv_utils line
+  # in the Loki journal -- which is exactly how this paragraph was re-derived five times.
   #
   # The three-day tail was a different failure and the one that hurt: MusicChecksStale
   # (severity=warning, for=15m, unsilenced, Discord on a 24h repeat) went pending 01:01Z and
