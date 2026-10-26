@@ -7,12 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"testing/fstest"
+	"time"
 
 	"github.com/deluan/rest"
 	_ "github.com/navidrome/navidrome/adapters/gotaglib" // Register taglib extractor
 	"github.com/navidrome/navidrome/conf/configtest"
 	"github.com/navidrome/navidrome/core"
 	_ "github.com/navidrome/navidrome/core/storage/local" // Register local storage
+	"github.com/navidrome/navidrome/core/storage/storagetest"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/server/events"
@@ -111,6 +114,29 @@ var _ = Describe("Library Service", func() {
 				var validationErr *rest.ValidationError
 				Expect(errors.As(err, &validationErr)).To(BeTrue())
 				Expect(validationErr.Errors["path"]).To(Equal("library path must be absolute"))
+			})
+
+			It("accepts a storage URI path and keeps it unchanged", func() {
+				fakeFS := &storagetest.FakeFS{}
+				fakeFS.SetFiles(fstest.MapFS{"Artist/Album/01.flac": {Data: []byte("x"), ModTime: time.Now()}})
+				storagetest.Register("fakelib", fakeFS)
+				library := &model.Library{ID: 1, Name: "Hi-Res", Path: "fakelib://originals"}
+
+				_, err := repo.Save(library)
+
+				Expect(err).NotTo(HaveOccurred())
+				Expect(libraryRepo.Data[1].Path).To(Equal("fakelib://originals"))
+			})
+
+			It("fails when a storage URI path has an unregistered scheme", func() {
+				library := &model.Library{Name: "Test", Path: "nosuchscheme://bucket"}
+
+				_, err := repo.Save(library)
+
+				Expect(err).To(HaveOccurred())
+				var validationErr *rest.ValidationError
+				Expect(errors.As(err, &validationErr)).To(BeTrue())
+				Expect(validationErr.Errors["path"]).To(ContainSubstring("invalid storage scheme"))
 			})
 
 			Context("Database constraint violations", func() {
