@@ -337,14 +337,15 @@ func (r *libraryRepositoryWrapper) validateLibrary(library *model.Library) error
 }
 
 func (r *libraryRepositoryWrapper) validateLibraryPath(library *model.Library) error {
-	// Validate path format
-	if !filepath.IsAbs(library.Path) {
-		return fmt.Errorf("library path must be absolute")
+	// A URI path (e.g. "s3://music") names a registered storage backend, not a local
+	// directory: filepath.IsAbs rejects it and filepath.Clean would fold "://" to ":/".
+	// storage.For below validates its scheme.
+	if !strings.Contains(library.Path, "://") {
+		if !filepath.IsAbs(library.Path) {
+			return fmt.Errorf("library path must be absolute")
+		}
+		library.Path = filepath.Clean(library.Path)
 	}
-
-	// Clean the path to normalize it
-	cleanPath := filepath.Clean(library.Path)
-	library.Path = cleanPath
 
 	// Check if path exists and is accessible using storage abstraction
 	fileStore, err := storage.For(library.Path)
