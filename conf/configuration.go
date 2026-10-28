@@ -129,7 +129,7 @@ type configOptions struct {
 	EnableScrobbleHistory           bool
 	Tags                            map[string]TagConf `json:",omitempty"`
 	Agents                          string
-	S3                              s3Options          `json:",omitzero"`
+	S3                              s3Options `json:",omitzero"`
 
 	// DevFlags. These are used to enable/disable debugging and incomplete features
 	DevLogLevels                      map[string]string `json:",omitempty"`
