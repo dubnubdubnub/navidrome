@@ -197,7 +197,7 @@ func TestS3PresignedURL(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	url, err := up.PresignedURL(ctx, track)
+	url, err := up.PresignedURL(ctx, track, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("PresignedURL(%q): %v", track, err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"time"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/conf/configtest"
@@ -1331,6 +1332,6 @@ func (remoteProbeStorage) FS() (storage.MusicFS, error) {
 
 type remoteProbeFS struct{ *storagetest.FakeFS }
 
-func (remoteProbeFS) PresignedURL(_ context.Context, p string) (string, error) {
+func (remoteProbeFS) PresignedURL(_ context.Context, p string, _ time.Duration) (string, error) {
 	return "http://presigned.invalid/" + p, nil
 }

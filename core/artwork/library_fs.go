@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/navidrome/navidrome/core/storage"
 	"github.com/navidrome/navidrome/model"
@@ -27,6 +28,11 @@ func (v libraryView) Abs(rel string) string {
 	return filepath.Join(v.absRoot, rel)
 }
 
+// artPresignExpiry bounds the presigned URL ffmpeg uses to pull embedded art out of an s3
+// object. Extraction reads the head of one file and takes seconds; the URL is a bearer
+// credential, so it should not outlive that by much.
+const artPresignExpiry = 5 * time.Minute
+
 // ffmpegInput returns the input ffmpeg should read for the given library-relative path:
 // a presigned HTTP URL when the library's backend supports it (s3://), otherwise the
 // absolute on-disk path (file://). Returns "" for an empty rel so callers can treat it
@@ -36,7 +42,7 @@ func (v libraryView) ffmpegInput(ctx context.Context, rel string) string {
 		return ""
 	}
 	if up, ok := v.FS.(storage.URLProvider); ok {
-		if u, err := up.PresignedURL(ctx, rel); err == nil {
+		if u, err := up.PresignedURL(ctx, rel, artPresignExpiry); err == nil {
 			return u
 		}
 		// Presigning failed; nothing readable for a remote backend (no local path

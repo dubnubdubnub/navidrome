@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"time"
 
 	"github.com/navidrome/navidrome/core/storage/storagetest"
 	"github.com/navidrome/navidrome/model"
@@ -68,6 +69,6 @@ var _ = Describe("remote library backing", func() {
 // urlProviderFS stands in for the s3 backend: a MusicFS that also presigns URLs.
 type urlProviderFS struct{ *storagetest.FakeFS }
 
-func (urlProviderFS) PresignedURL(_ context.Context, path string) (string, error) {
+func (urlProviderFS) PresignedURL(_ context.Context, path string, _ time.Duration) (string, error) {
 	return "https://garage.example/" + path, nil
 }

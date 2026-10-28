@@ -38,35 +38,81 @@ import (
 )
 
 // s3Storage implements storage.Storage backed by an S3-compatible bucket.
+//
+// storage.For builds a new s3Storage on every call (the scanner, the streamer and the
+// artwork resolver each ask per request), so it holds no connection state itself: FS()
+// resolves through the package-level fsCache, which keeps one minio client (and so one
+// HTTP transport and its connection pool) per bucket + connection settings.
 type s3Storage struct {
 	u      url.URL
 	bucket string
-
-	once   sync.Once
-	client *minio.Client
-	initFS *s3FS
-	initSt error
+	err    error // a malformed library URI, reported by FS()
 }
 
 func newS3Storage(u url.URL) storage.Storage {
-	// Determine the bucket. For "s3://music" the bucket is the URL host. For
-	// "s3:///music" (used by some configs/tests) it ends up in the path.
-	bucket := u.Host
-	if bucket == "" {
-		bucket = strings.Trim(u.Path, "/")
-	}
-	return &s3Storage{u: u, bucket: bucket}
+	bucket, err := bucketFromURL(u)
+	return &s3Storage{u: u, bucket: bucket, err: err}
 }
 
-func (s *s3Storage) connect() (*minio.Client, error) {
+// bucketFromURL returns the bucket a library URI names. A library is a whole bucket:
+// "s3://music" (bucket in the host) or the legacy "s3:///music" (bucket as the only path
+// segment). Anything that would name a prefix inside a bucket ("s3://music/rock") is
+// rejected rather than silently widened to the whole bucket, because two libraries on
+// different prefixes of one bucket would otherwise both see every object in it, breaking
+// per-library access control.
+func bucketFromURL(u url.URL) (string, error) {
+	p := strings.Trim(u.Path, "/")
+	switch {
+	case u.Host != "" && p == "":
+		return u.Host, nil
+	case u.Host == "" && p != "" && !strings.Contains(p, "/"):
+		return p, nil
+	case u.Host == "" && p == "":
+		return "", fmt.Errorf("s3: no bucket in library path %q", u.String())
+	default:
+		return "", fmt.Errorf("s3: library path %q names a prefix inside a bucket; only whole buckets (s3://<bucket>) are supported", u.String())
+	}
+}
+
+// fsKey identifies a cached s3FS: the bucket plus every setting the client or the tag
+// extractor was built from, so a config change (or a test overriding it) gets a fresh one
+// instead of a stale client.
+type fsKey struct {
+	bucket    string
+	cfg       s3Config
+	extractor string
+}
+
+var (
+	fsCacheMu sync.Mutex
+	fsCache   = map[fsKey]*s3FS{}
+)
+
+func (s *s3Storage) FS() (storage.MusicFS, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	cfg := loadConfig()
+	key := fsKey{bucket: s.bucket, cfg: cfg, extractor: conf.Server.Scanner.Extractor}
+
+	fsCacheMu.Lock()
+	defer fsCacheMu.Unlock()
+	if sfs, ok := fsCache[key]; ok {
+		return sfs, nil
+	}
+	// Errors are not cached: a missing endpoint or extractor is retried on the next call.
+	sfs, err := newS3FS(cfg, s.bucket, key.extractor)
+	if err != nil {
+		return nil, err
+	}
+	fsCache[key] = sfs
+	return sfs, nil
+}
+
+func newS3FS(cfg s3Config, bucket, extractorID string) (*s3FS, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("s3: no endpoint configured (set S3.Endpoint or ND_S3_ENDPOINT)")
 	}
-	if s.bucket == "" {
-		return nil, fmt.Errorf("s3: no bucket in library path %q", s.u.String())
-	}
-
 	host, useSSL := normalizeEndpoint(cfg.Endpoint, cfg.UseSSL)
 	opts := &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
@@ -80,39 +126,21 @@ func (s *s3Storage) connect() (*minio.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3: creating client: %w", err)
 	}
-	return client, nil
-}
-
-func (s *s3Storage) FS() (storage.MusicFS, error) {
-	s.once.Do(func() {
-		client, err := s.connect()
-		if err != nil {
-			s.initSt = err
-			return
+	sfs := &s3FS{client: client, bucket: bucket}
+	// Build the tag extractor against this fs.FS, mirroring local storage's
+	// selection logic (fall back to the default if the configured one is missing).
+	ctor, ok := local.GetExtractor(extractorID)
+	if !ok || ctor == nil {
+		if extractorID != "" && extractorID != consts.DefaultScannerExtractor {
+			log.Warn("S3: Extractor not found, using default", "extractor", extractorID, "default", consts.DefaultScannerExtractor)
 		}
-		s.client = client
-		sfs := &s3FS{client: client, bucket: s.bucket}
-		// Build the tag extractor against this fs.FS, mirroring local storage's
-		// selection logic (fall back to the default if the configured one is missing).
-		id := conf.Server.Scanner.Extractor
-		ctor, ok := local.GetExtractor(id)
-		if !ok || ctor == nil {
-			if id != "" && id != consts.DefaultScannerExtractor {
-				log.Warn("S3: Extractor not found, using default", "extractor", id, "default", consts.DefaultScannerExtractor)
-			}
-			ctor, _ = local.GetExtractor(consts.DefaultScannerExtractor)
-		}
-		if ctor == nil {
-			s.initSt = fmt.Errorf("s3: no tag extractor registered (default %q missing)", consts.DefaultScannerExtractor)
-			return
-		}
-		sfs.extractor = ctor(sfs, "s3://"+s.bucket)
-		s.initFS = sfs
-	})
-	if s.initSt != nil {
-		return nil, s.initSt
+		ctor, _ = local.GetExtractor(consts.DefaultScannerExtractor)
 	}
-	return s.initFS, nil
+	if ctor == nil {
+		return nil, fmt.Errorf("s3: no tag extractor registered (default %q missing)", consts.DefaultScannerExtractor)
+	}
+	sfs.extractor = ctor(sfs, "s3://"+bucket)
+	return sfs, nil
 }
 
 // s3Config holds resolved connection settings.
@@ -223,20 +251,21 @@ func (w s3FileInfoWrapper) BirthTime() time.Time {
 
 func (sfs *s3FS) ctx() context.Context { return context.Background() }
 
-// presignedURLExpiry is how long a presigned GET URL stays valid. It needs to comfortably
-// outlast a single transcode/stream of one track, but be short enough that a leaked URL is
-// of limited use.
-const presignedURLExpiry = 6 * time.Hour
-
-// PresignedURL implements storage.URLProvider. It returns a time-limited HTTP(S) URL that
-// grants read access to the object at the given library-relative path, suitable for handing
-// to ffmpeg as an input. This is what lets transcoding work against an s3:// library without
-// a local file: ffmpeg fetches the object directly over HTTP via ranged GETs.
-func (sfs *s3FS) PresignedURL(ctx context.Context, name string) (string, error) {
+// PresignedURL implements storage.URLProvider. It returns an HTTP(S) URL valid for expiry
+// that grants read access to the object at the given library-relative path, suitable for
+// handing to ffmpeg as an input. This is what lets transcoding work against an s3:// library
+// without a local file: ffmpeg fetches the object directly over HTTP via ranged GETs. The URL
+// carries the access key ID and a signature in its query string, so callers must keep it out
+// of logs and errors (see ffmpeg.RedactURLs) and should ask for the shortest expiry that
+// covers their read.
+func (sfs *s3FS) PresignedURL(ctx context.Context, name string, expiry time.Duration) (string, error) {
 	if !fs.ValidPath(name) {
 		return "", &fs.PathError{Op: "presign", Path: name, Err: fs.ErrInvalid}
 	}
-	u, err := sfs.client.PresignedGetObject(ctx, sfs.bucket, name, presignedURLExpiry, url.Values{})
+	if expiry <= 0 {
+		return "", fmt.Errorf("s3: presigning %s: non-positive expiry %s", name, expiry)
+	}
+	u, err := sfs.client.PresignedGetObject(ctx, sfs.bucket, name, expiry, url.Values{})
 	if err != nil {
 		return "", fmt.Errorf("s3: presigning %s: %w", name, err)
 	}
