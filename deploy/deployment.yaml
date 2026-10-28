@@ -31,7 +31,8 @@ spec:
         # 2 = ND_SCANSCHEDULE -> ND_SCANNER_SCHEDULE (PR #1, 2026-10-25). That key was
         # never read by this Navidrome version, so `Periodic scan is DISABLED` was logged
         # at every boot and the library only ever scanned on startup.
-        config.navidrome.dubnubdubnub.com/revision: "2"
+        # 3 = ND_ENABLEINSIGHTSCOLLECTOR=false (2026-10-28).
+        config.navidrome.dubnubdubnub.com/revision: "3"
     spec:
       imagePullSecrets:
         - { name: ghcr-pull }
