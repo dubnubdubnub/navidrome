@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"path/filepath"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/conf/configtest"
 	"github.com/navidrome/navidrome/core/auth"
 	"github.com/navidrome/navidrome/core/ffmpeg"
+	"github.com/navidrome/navidrome/core/storage"
+	"github.com/navidrome/navidrome/core/storage/storagetest"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/tests"
@@ -1253,6 +1257,29 @@ var _ = Describe("Decider", func() {
 			Expect(stored.ProbeData).To(Equal(mf.ProbeData))
 		})
 
+		It("probes a remote (s3://) library file through its presigned URL, not a local path", func() {
+			storage.Register("remoteprobe", func(url.URL) storage.Storage { return remoteProbeStorage{} })
+			mf := &model.MediaFile{ID: "probe-s3", Suffix: "flac", LibraryPath: "remoteprobe://bucket", Path: "a/b.flac"}
+			mockMFRepo.SetData(model.MediaFiles{*mf})
+			ff.ProbeAudioResult = &ffmpeg.AudioProbeResult{Codec: "flac", SampleRate: 44100, Channels: 2}
+
+			svc := NewTranscodeDecider(ds, ff).(*deciderService)
+			_, err := svc.ensureProbed(ctx, mf)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(ff.ProbedPath).To(Equal("http://presigned.invalid/a/b.flac"))
+		})
+
+		It("probes a bare-path library file at its absolute path", func() {
+			mf := &model.MediaFile{ID: "probe-local", Suffix: "mp3", LibraryPath: "/music", Path: "a/b.mp3"}
+			mockMFRepo.SetData(model.MediaFiles{*mf})
+			ff.ProbeAudioResult = &ffmpeg.AudioProbeResult{Codec: "mp3"}
+
+			svc := NewTranscodeDecider(ds, ff).(*deciderService)
+			_, err := svc.ensureProbed(ctx, mf)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(ff.ProbedPath).To(Equal(filepath.Join("/music", "a/b.mp3")))
+		})
+
 		It("skips ffprobe when ProbeData is already set", func() {
 			mf := withProbe(&model.MediaFile{ID: "probe-2", Suffix: "flac", Codec: "FLAC", BitRate: 1000, Channels: 2})
 
@@ -1293,3 +1320,17 @@ var _ = Describe("Decider", func() {
 	})
 
 })
+
+// remoteProbeStorage is a minimal s3-like backend: a MusicFS that also implements
+// storage.URLProvider, which is what routes ffprobe to a presigned URL.
+type remoteProbeStorage struct{}
+
+func (remoteProbeStorage) FS() (storage.MusicFS, error) {
+	return remoteProbeFS{&storagetest.FakeFS{}}, nil
+}
+
+type remoteProbeFS struct{ *storagetest.FakeFS }
+
+func (remoteProbeFS) PresignedURL(_ context.Context, p string) (string, error) {
+	return "http://presigned.invalid/" + p, nil
+}
