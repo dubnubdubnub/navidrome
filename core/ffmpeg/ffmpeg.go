@@ -192,9 +192,12 @@ func (e *ffmpeg) ProbeAudioStream(ctx context.Context, filePath string) (*AudioP
 	if _, err := ffmpegCmd(); err != nil {
 		return nil, err
 	}
-	if err := fileExists(filePath); err != nil {
-		return nil, &ProbeError{Path: filePath, Reason: fileAccessReason(err),
-			NotFound: errors.Is(err, fs.ErrNotExist), err: err}
+	// A presigned URL (s3:// library) has no local file to stat; ffprobe fetches it directly.
+	if !isRemoteInput(filePath) {
+		if err := fileExists(filePath); err != nil {
+			return nil, &ProbeError{Path: filePath, Reason: fileAccessReason(err),
+				NotFound: errors.Is(err, fs.ErrNotExist), err: err}
+		}
 	}
 	args := createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0)
 	log.Trace(ctx, "Executing ffprobe command", "args", args)
