@@ -74,7 +74,7 @@ func (api *Router) searchAll(ctx context.Context, sp *searchParams, musicFolderI
 	if len(musicFolderIds) > 0 {
 		songOpts.Filters = Eq{"library_id": musicFolderIds}
 		albumOpts.Filters = Eq{"library_id": musicFolderIds}
-		artistOpts.Filters = Eq{"library_artist.library_id": musicFolderIds}
+		artistOpts.Filters = Eq{"library_id": musicFolderIds}
 	}
 
 	// Run searches in parallel
@@ -110,11 +110,13 @@ func (api *Router) Search2(r *http.Request) (*responses.Subsonic, error) {
 	searchResult2 := &responses.SearchResult2{}
 	searchResult2.Artist = slice.Map(as, func(artist model.Artist) responses.Artist {
 		a := responses.Artist{
-			Id:             artist.ID,
-			Name:           artist.Name,
-			UserRating:     int32(artist.Rating),
-			CoverArt:       artist.CoverArtID().String(),
-			ArtistImageUrl: publicurl.ImageURL(r, artist.CoverArtID(), 600),
+			Id:         artist.ID,
+			Name:       artist.Name,
+			UserRating: int32(artist.Rating),
+			CoverArt:   coverArtOrEmpty(artist.CoverArtID(), artist.ImageAbsent),
+		}
+		if !artist.ImageAbsent {
+			a.ArtistImageUrl = publicurl.ImageURL(r.Context(), artist.CoverArtID(), 600)
 		}
 		if artist.Starred {
 			a.Starred = artist.StarredAt
