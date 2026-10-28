@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"io/fs"
+	"time"
 
 	"github.com/navidrome/navidrome/model/metadata"
 )
@@ -17,6 +18,14 @@ type MusicFS interface {
 	ReadTags(path ...string) (map[string]metadata.Info, error)
 }
 
+// SymlinkResolverFS is an optional interface for MusicFS implementations backed by a real
+// filesystem. ResolveSymlink resolves the whole symlink chain of the named entry at the OS
+// level and returns the final target's path — including targets outside the FS root, which
+// fs.ReadLink-based resolution cannot follow.
+type SymlinkResolverFS interface {
+	ResolveSymlink(name string) (string, error)
+}
+
 // URLProvider is an optional interface that a Storage or MusicFS may implement to
 // produce a time-limited, directly-fetchable URL (e.g. a presigned S3 GET URL) for
 // a library-relative path. Backends whose objects are reachable over HTTP (S3, etc.)
@@ -25,10 +34,11 @@ type MusicFS interface {
 // of a local file path. The local (file://) backend deliberately does NOT implement
 // this, so callers fall back to the on-disk path for local libraries.
 type URLProvider interface {
-	// PresignedURL returns an HTTP(S) URL that grants temporary read access to the
-	// object at the given library-relative path. The URL is valid for at least the
-	// duration ffmpeg needs to read the file.
-	PresignedURL(ctx context.Context, path string) (string, error)
+	// PresignedURL returns an HTTP(S) URL that grants read access to the object at the
+	// given library-relative path for expiry. The URL is a bearer credential (it carries
+	// the signing key ID and a signature): keep it out of logs and errors, and ask for the
+	// shortest expiry that covers the read.
+	PresignedURL(ctx context.Context, path string, expiry time.Duration) (string, error)
 }
 
 // Watcher is a storage with the ability watch the FS and notify changes

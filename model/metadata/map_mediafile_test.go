@@ -117,4 +117,41 @@ var _ = Describe("ToMediaFile", func() {
 			Expect(actual).To(Equal(expected))
 		})
 	})
+
+	Describe("BPM", func() {
+		It("maps the BPM tag rounded to the nearest integer", func() {
+			mf = toMediaFile(model.RawTags{"BPM": {"120.6"}})
+			Expect(mf.BPM).To(Equal(new(121)))
+		})
+		It("leaves BPM nil when the tag is absent", func() {
+			mf = toMediaFile(model.RawTags{})
+			Expect(mf.BPM).To(BeNil())
+		})
+		It("leaves BPM nil when the tag is zero or unparseable", func() {
+			Expect(toMediaFile(model.RawTags{"BPM": {"0"}}).BPM).To(BeNil())
+			Expect(toMediaFile(model.RawTags{"BPM": {"fast"}}).BPM).To(BeNil())
+		})
+		It("leaves BPM nil when the tag does not fit in 32 bits", func() {
+			Expect(toMediaFile(model.RawTags{"BPM": {"4294967295"}}).BPM).To(BeNil())
+		})
+		It("leaves BPM nil when the tag is negative", func() {
+			Expect(toMediaFile(model.RawTags{"BPM": {"-120"}}).BPM).To(BeNil())
+		})
+		It("keeps the largest 32-bit BPM value", func() {
+			Expect(toMediaFile(model.RawTags{"BPM": {"2147483647"}}).BPM).To(Equal(new(2147483647)))
+		})
+	})
+
+	Describe("BitDepth", func() {
+		It("maps the bit depth when present", func() {
+			props.AudioProperties = metadata.AudioProperties{BitDepth: 24}
+			mf = toMediaFile(model.RawTags{})
+			Expect(mf.BitDepth).To(Equal(new(24)))
+		})
+		It("leaves BitDepth nil when zero (lossy codecs have no bit depth)", func() {
+			props.AudioProperties = metadata.AudioProperties{BitDepth: 0}
+			mf = toMediaFile(model.RawTags{})
+			Expect(mf.BitDepth).To(BeNil())
+		})
+	})
 })

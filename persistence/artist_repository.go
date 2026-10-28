@@ -19,6 +19,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/utils"
 	"github.com/navidrome/navidrome/utils/slice"
+	"github.com/navidrome/navidrome/utils/str"
 	"github.com/pocketbase/dbx"
 )
 
@@ -102,8 +103,10 @@ func (a *dbArtist) PostMapArgs(m map[string]any) error {
 	}
 	similarArtists, _ := json.Marshal(sa)
 	m["similar_artists"] = string(similarArtists)
+	// When adding a derived column here, also add it to the scanner's artist Put column list
+	// in phase_1_folders.go, or rescans will never update it (how search_normalized went stale).
 	m["full_text"] = formatFullText(a.Name, a.SortArtistName)
-	m["search_normalized"] = normalizeForFTS(a.Name)
+	m["search_normalized"] = str.NormalizeForFTS(a.Name)
 
 	// Do not override the sort_artist_name and mbz_artist_id fields if they are empty
 	// TODO: Better way to handle this?
@@ -159,11 +162,24 @@ func NewArtistRepository(ctx context.Context, db dbx.Builder) model.ArtistReposi
 
 func roleFilter(_ string, role any) Sqlizer {
 	if role, ok := role.(string); ok {
-		if _, ok := model.AllRoles[role]; ok {
-			return Expr("JSON_EXTRACT(library_artist.stats, '$." + role + ".m') IS NOT NULL")
+		if safe, ok := sanitizeArtistStatsRole(role); ok && safe != "total" {
+			return Expr("JSON_EXTRACT(library_artist.stats, '$." + safe + ".m') IS NOT NULL")
 		}
 	}
 	return Eq{"1": 2}
+}
+
+// sanitizeArtistStatsRole allowlists values interpolated into JSON paths for artist
+// stats (filter and sort). "total" is the aggregate key stored by the scanner.
+// Unknown values must not reach SQL string concatenation.
+func sanitizeArtistStatsRole(role string) (string, bool) {
+	if role == "" || role == "total" {
+		return "total", true
+	}
+	if _, ok := model.AllRoles[role]; ok {
+		return role, true
+	}
+	return "", false
 }
 
 // artistLibraryIdFilter filters artists based on library access through the library_artist table
@@ -201,7 +217,11 @@ func (r *artistRepository) selectArtist(options ...model.QueryOptions) SelectBui
 func (r *artistRepository) CountAll(options ...model.QueryOptions) (int64, error) {
 	query := r.newSelect()
 	query = r.applyLibraryFilterToArtistQuery(query)
-	query = r.withAnnotation(query, "artist.id")
+	// Only the annotation join is gated; the library_artist join above (and its count(distinct))
+	// must stay, since an artist can span multiple libraries.
+	if filtersNeedAnnotation(r.applyFilters(query, options...)) {
+		query = r.withAnnotation(query, "artist.id")
+	}
 	return r.count(query, options...)
 }
 
@@ -242,6 +262,7 @@ func (r *artistRepository) Get(id string) (*model.Artist, error) {
 		return nil, model.ErrNotFound
 	}
 	res := dba.toModels()
+	r.hydrateArtwork(res)
 	return &res[0], nil
 }
 
@@ -253,7 +274,37 @@ func (r *artistRepository) GetAll(options ...model.QueryOptions) (model.Artists,
 		return nil, err
 	}
 	res := dba.toModels()
+	r.hydrateArtwork(res)
 	return res, err
+}
+
+// getAllIDs returns just the artist IDs for the same row set as GetAll, skipping the
+// heavy stats columns and JSON post-processing.
+func (r *artistRepository) getAllIDs(options ...model.QueryOptions) ([]string, error) {
+	sq := r.applyLibraryFilterToArtistQuery(r.newSelect(options...).Columns("artist.id")).GroupBy("artist.id")
+	if filtersNeedAnnotation(sq) {
+		sq = r.withAnnotation(sq, "artist.id")
+	}
+	ids := []string{}
+	err := r.queryAllSlice(sq, &ids)
+	return ids, err
+}
+
+// hydrateArtwork fills each artist's ImageHash/ImageAbsent from one batched item_artwork lookup.
+func (r *artistRepository) hydrateArtwork(artists model.Artists) {
+	hydrateItems(r.ctx, r.db, model.KindArtistArtwork, artists,
+		func(a *model.Artist) (string, *model.ItemImage) { return a.ID, &a.ItemImage })
+}
+
+func (r *artistRepository) GetCursor(options ...model.QueryOptions) (model.ArtistCursor, error) {
+	ids, err := r.getAllIDs(options...)
+	if err != nil {
+		return nil, err
+	}
+	opts := chunkOptions(options, "artist.id")
+	return model.ArtistCursor(streamByIDs(ids, func(chunk []string) (model.Artists, error) {
+		return r.GetAll(opts(chunk))
+	})), nil
 }
 
 func (r *artistRepository) getIndexKey(a model.Artist) string {
@@ -349,6 +400,19 @@ func (r *artistRepository) purgeEmpty() error {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			log.Warn(r.ctx, "Failed to remove artist image during GC", "path", path, err)
 		}
+	}
+	return nil
+}
+
+// markOrphansMissing flags as missing any non-missing artist with no library_artist row, keeping the
+// search fast-path's `missing = false` filter correct (see searchCfg). Called wherever such a row can
+// be dropped: RefreshStats cleanup and library deletion cascade.
+func (r *artistRepository) markOrphansMissing() error {
+	_, err := r.executeSQL(Expr(
+		"update artist set missing = true where missing = false " +
+			"and not exists (select 1 from library_artist where library_artist.artist_id = artist.id)"))
+	if err != nil {
+		return fmt.Errorf("marking orphaned artists missing: %w", err)
 	}
 	return nil
 }
@@ -527,42 +591,62 @@ func (r *artistRepository) RefreshStats(allArtists bool) (int64, error) {
 		totalRowsAffected += rowsAffected
 	}
 
-	// // Remove library_artist entries for artists that no longer have any content in any library
+	// Remove library_artist entries for artists that no longer have any content in a library.
 	cleanupSQL := Delete("library_artist").Where("stats = '{}'")
 	cleanupRows, err := r.executeSQL(cleanupSQL)
 	if err != nil {
-		log.Warn(r.ctx, "Failed to cleanup empty library_artist entries", "error", err)
-	} else if cleanupRows > 0 {
-		log.Debug(r.ctx, "Cleaned up empty library_artist entries", "rowsDeleted", cleanupRows)
+		log.Warn(r.ctx, "Failed to cleanup empty library_artist entries", err)
+	} else {
+		if cleanupRows > 0 {
+			log.Debug(r.ctx, "Cleaned up empty library_artist entries", "rowsDeleted", cleanupRows)
+		}
+		// Reconcile orphans whenever the cleanup removed rows, and on a full refresh so a full scan
+		// also heals any left by older versions.
+		if cleanupRows > 0 || allArtists {
+			if err := r.markOrphansMissing(); err != nil {
+				log.Warn(r.ctx, "Failed to mark orphaned artists missing after library_artist cleanup", err)
+			}
+		}
 	}
 
 	log.Debug(r.ctx, "RefreshStats: Successfully updated stats.", "totalArtistsProcessed", len(allTouchedArtistIDs), "totalDBRowsAffected", totalRowsAffected)
 	return totalRowsAffected, nil
 }
 
-// applyLibraryFilterToSearchQuery is applyLibraryFilterToArtistQuery with the join order
-// pinned via CROSS JOIN (SQLite's explicit join-order override): the search Phase 1 paginates
-// rowids by artist.id, and when the planner drives from library_artist it must sort every
-// junction row on every page (temp b-tree over the whole table). Keeping artist as the outer
-// table streams rows in artist.id order from its primary key index, so LIMIT/OFFSET
-// short-circuits. Search-only: other artist queries keep the planner's freedom.
-func (r *artistRepository) applyLibraryFilterToSearchQuery(query SelectBuilder) SelectBuilder {
-	user := loggedUser(r.ctx)
-	query = query.CrossJoin("library_artist on library_artist.artist_id = artist.id")
-	if user.ID != invalidUserId && !user.IsAdmin {
-		query = query.Join("user_library on user_library.library_id = library_artist.library_id AND user_library.user_id = ?", user.ID)
-	}
-	return query
-}
-
-func (r *artistRepository) searchCfg() searchConfig {
+// searchCfg builds the per-search config. scope is the set of library IDs the rowid Phase 1 must
+// restrict artists to, or nil to skip the filter (fast-path). See [artistRepository.searchScope].
+func (r *artistRepository) searchCfg(scope []int) searchConfig {
 	return searchConfig{
 		// Natural order for artists is more performant by ID, due to GROUP BY clause in selectArtist
-		NaturalOrder:  "artist.id",
-		OrderBy:       []string{"sum(json_extract(stats, '$.total.m')) desc", "name"},
-		MBIDFields:    []string{"mbz_artist_id"},
-		LibraryFilter: r.applyLibraryFilterToSearchQuery,
+		NaturalOrder: "artist.id",
+		OrderBy:      []string{"sum(json_extract(stats, '$.total.m')) desc", "name"},
+		MBIDFields:   []string{"mbz_artist_id"},
+		// scope==nil is the fast-path: no filter (and orphans must not exist — see markOrphansMissing).
+		// Otherwise the join-free [artistLibraryFilter].
+		LibraryFilter: func(query SelectBuilder) SelectBuilder {
+			if scope == nil {
+				return query
+			}
+			return query.Where(artistLibraryFilter(scope))
+		},
 	}
+}
+
+// artistLibraryFilter restricts artists to the given libraries via a correlated EXISTS over the
+// library_artist junction, staying join-free so it can scope the join-free search Phase 1 (a JOIN
+// would fan out rowids and corrupt offset pagination). The inner LIMIT 1 is load-bearing: it stops
+// SQLite from flattening the EXISTS back into a fan-out join, while still using the
+// (library_id, artist_id) UNIQUE autoindex.
+func artistLibraryFilter(libraryIDs []int) Sqlizer {
+	if len(libraryIDs) == 0 {
+		return Eq{"1": 2} // match nothing, without a degenerate `IN ()` subquery
+	}
+	sub, args, _ := Select("1").From("library_artist").
+		Where(And{
+			Expr("library_artist.artist_id = artist.id"),
+			Eq{"library_artist.library_id": libraryIDs},
+		}).Limit(1).ToSql()
+	return Expr("EXISTS ("+sub+")", args...)
 }
 
 func (r *artistRepository) Search(q string, options ...model.QueryOptions) (model.Artists, error) {
@@ -570,12 +654,67 @@ func (r *artistRepository) Search(q string, options ...model.QueryOptions) (mode
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	// Artists have no library_id column, so the library_id filter callers pass (same as albums/songs)
+	// can't be applied directly: consume it and realize it as a join-free Phase-1 scope (searchCfg).
+	scope := r.searchScope(opts.Filters)
+	if isLibraryIDFilter(opts.Filters) {
+		opts.Filters = nil
+	}
 	var res dbArtists
-	err := r.doSearch(r.selectArtist(options...), q, &res, r.searchCfg(), opts)
+	err := r.doSearch(r.selectArtist(opts), q, &res, r.searchCfg(scope), opts)
 	if err != nil {
 		return nil, fmt.Errorf("searching artist %q: %w", q, err)
 	}
-	return res.toModels(), nil
+	artists := res.toModels()
+	r.hydrateArtwork(artists)
+	return artists, nil
+}
+
+// searchScope returns the library IDs the search must be restricted to, or nil to skip the filter
+// entirely (the fast-path: the user sees everything the search could return, so a filter would be
+// pure O(offset) overhead). It intersects the requested libraries with what the user can see.
+func (r *artistRepository) searchScope(filter Sqlizer) []int {
+	visible, err := r.visibleLibraryIDs()
+	if err != nil {
+		return r.requestedLibraryIDs(filter) // fail safe: narrow to the request rather than widen
+	}
+	requested := r.requestedLibraryIDs(filter)
+	if requested == nil {
+		// No explicit request: scope to the visible set, unless the user sees everything.
+		if r.userSeesAllLibraries(visible) {
+			return nil
+		}
+		return visible
+	}
+	// Narrow unless the request already covers everything the user can see. Compare by membership,
+	// not length: the requested IDs may contain duplicates.
+	requestedSet := slice.ToSet(requested)
+	if slices.ContainsFunc(visible, func(id int) bool { _, ok := requestedSet[id]; return !ok }) {
+		return requested
+	}
+	return nil
+}
+
+// requestedLibraryIDs extracts the []int from an Eq{"library_id": ids} filter, or nil if filter is
+// not that shape.
+func (r *artistRepository) requestedLibraryIDs(filter Sqlizer) []int {
+	eq, ok := filter.(Eq)
+	if !ok {
+		return nil
+	}
+	ids, _ := eq["library_id"].([]int)
+	return ids
+}
+
+// isLibraryIDFilter reports whether the filter is an Eq carrying a library_id key, so Search can
+// consume it before it reaches the bare artist table (which has no library_id column).
+func isLibraryIDFilter(filter Sqlizer) bool {
+	eq, ok := filter.(Eq)
+	if !ok {
+		return false
+	}
+	_, ok = eq["library_id"]
+	return ok
 }
 
 func (r *artistRepository) Count(options ...rest.QueryOptions) (int64, error) {
@@ -590,7 +729,9 @@ func (r *artistRepository) ReadAll(options ...rest.QueryOptions) (any, error) {
 	role := "total"
 	if len(options) > 0 {
 		if v, ok := options[0].Filters["role"].(string); ok {
-			role = v
+			if safe, ok := sanitizeArtistStatsRole(v); ok {
+				role = safe
+			}
 		}
 	}
 	r.sortMappings["song_count"] = "sum(stats->>'" + role + "'->>'m')"

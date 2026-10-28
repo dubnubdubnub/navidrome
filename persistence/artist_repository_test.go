@@ -15,6 +15,7 @@ import (
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/utils"
+	"github.com/navidrome/navidrome/utils/slice"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -111,6 +112,126 @@ var _ = Describe("ArtistRepository", func() {
 			})
 		})
 
+		Describe("sanitizeArtistStatsRole", func() {
+			It("allowlists total and registered roles", func() {
+				role, ok := sanitizeArtistStatsRole("total")
+				Expect(ok).To(BeTrue())
+				Expect(role).To(Equal("total"))
+				role, ok = sanitizeArtistStatsRole("albumartist")
+				Expect(ok).To(BeTrue())
+				Expect(role).To(Equal("albumartist"))
+			})
+
+			It("rejects SQL injection payloads used in sort mappings", func() {
+				payload := "total'||(SELECT password FROM user LIMIT 1)||'"
+				role, ok := sanitizeArtistStatsRole(payload)
+				Expect(ok).To(BeFalse())
+				Expect(role).To(BeEmpty())
+			})
+		})
+
+		Describe("ReadAll role sort SQL injection", func() {
+			It("does not interpolate attacker-controlled role into ORDER BY", func() {
+				ctx := request.WithUser(GinkgoT().Context(), adminUser)
+				repo := NewArtistRepository(ctx, GetDBXBuilder()).(*artistRepository)
+				payload := "total') OR 1=1--"
+				_, err := repo.ReadAll(rest.QueryOptions{
+					Sort:    "songCount",
+					Order:   "ASC",
+					Filters: map[string]any{"role": payload},
+				})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(repo.sortMappings["song_count"]).To(Equal("sum(stats->>'total'->>'m')"))
+				Expect(repo.sortMappings["song_count"]).ToNot(ContainSubstring(payload))
+			})
+
+			It("keeps valid role sort paths", func() {
+				ctx := request.WithUser(GinkgoT().Context(), adminUser)
+				repo := NewArtistRepository(ctx, GetDBXBuilder()).(*artistRepository)
+				_, err := repo.ReadAll(rest.QueryOptions{
+					Sort:    "songCount",
+					Order:   "DESC",
+					Filters: map[string]any{"role": "composer"},
+				})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(repo.sortMappings["song_count"]).To(Equal("sum(stats->>'composer'->>'m')"))
+			})
+		})
+
+		Describe("searchScope", func() {
+			// Resolves the library IDs a search must be restricted to (nil = fast-path / no filter),
+			// the way Search() does, for a repo whose context carries the given user.
+			scope := func(user model.User, filter squirrel.Sqlizer) []int {
+				ctx := request.WithUser(GinkgoT().Context(), user)
+				r := NewArtistRepository(ctx, GetDBXBuilder()).(*artistRepository)
+				return r.searchScope(filter)
+			}
+			subsetUser := model.User{ID: "u", Libraries: model.Libraries{{ID: 1}, {ID: 2}, {ID: 3}}}
+
+			It("scopes to a strict subset of the user's libraries", func() {
+				Expect(scope(subsetUser, squirrel.Eq{"library_id": []int{1, 2}})).To(Equal([]int{1, 2}))
+			})
+
+			It("treats duplicate IDs as a set so a real subset still narrows", func() {
+				// {1,1,2} has 3 entries but is a strict subset of the user's 3 libraries.
+				Expect(scope(subsetUser, squirrel.Eq{"library_id": []int{1, 1, 2}})).To(Equal([]int{1, 1, 2}))
+			})
+
+			It("returns nil (fast-path) when the request covers all the user's libraries", func() {
+				Expect(scope(subsetUser, squirrel.Eq{"library_id": []int{1, 2, 3}})).To(BeNil())
+			})
+
+			It("scopes to the user's libraries when no library filter is given", func() {
+				// A restricted user (strictly fewer libs than exist) with no musicFolderId is still
+				// confined to their granted libs. Build the user with total-1 libraries derived from
+				// the real DB total, so the "sees all" fast-path can't kick in regardless of count.
+				total, err := NewLibraryRepository(GinkgoT().Context(), GetDBXBuilder()).CountAll()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(total).To(BeNumerically(">", 0))
+				libs := make(model.Libraries, 0, total-1)
+				for i := int64(1); i < total; i++ { // total-1 distinct libraries → a strict subset
+					libs = append(libs, model.Library{ID: int(i)})
+				}
+				restricted := model.User{ID: "r", Libraries: libs}
+				got := scope(restricted, nil)
+				Expect(got).To(HaveLen(int(total) - 1))
+			})
+
+			It("returns nil (fast-path) for an admin requesting all existing libraries", func() {
+				// Admins see every library, so the visible set is the whole library table — derive
+				// it from the DB rather than assuming a count.
+				var allLibs []int
+				Expect(NewLibraryRepository(GinkgoT().Context(), GetDBXBuilder()).(*libraryRepository).
+					queryAllSlice(squirrel.Select("id").From("library"), &allLibs)).To(Succeed())
+				admin := model.User{ID: "a", IsAdmin: true}
+				Expect(scope(admin, squirrel.Eq{"library_id": allLibs})).To(BeNil())
+				Expect(scope(admin, nil)).To(BeNil())
+			})
+
+			It("narrows for an admin explicitly requesting a subset via musicFolderId", func() {
+				// An admin scoping to a single, non-existent-as-the-whole-set library must still be
+				// narrowed (regression: search3?musicFolderId=lib2 was leaking lib1 content).
+				admin := model.User{ID: "a", IsAdmin: true}
+				Expect(scope(admin, squirrel.Eq{"library_id": []int{-1}})).To(Equal([]int{-1}))
+			})
+
+			It("returns nil for a non-library_id filter (no library scoping requested)", func() {
+				// Such a filter carries no library intent; for this fully-granted-style user the
+				// search needs no extra library restriction.
+				allUser := model.User{ID: "u2", IsAdmin: true}
+				Expect(scope(allUser, squirrel.Eq{"name": "x"})).To(BeNil())
+			})
+
+			It("falls back to the visible scope for a malformed library_id value (no crash)", func() {
+				// A library_id filter whose value isn't []int is still recognized as a library
+				// filter (so Search consumes it and it never reaches the bare artist table), and
+				// searchScope falls back to exactly the no-filter behavior rather than crashing.
+				malformed := squirrel.Eq{"library_id": "not-a-slice"}
+				Expect(isLibraryIDFilter(malformed)).To(BeTrue())
+				Expect(scope(subsetUser, malformed)).To(Equal(scope(subsetUser, nil)))
+			})
+		})
+
 		Describe("dbArtist mapping", func() {
 			var (
 				artist *model.Artist
@@ -194,10 +315,54 @@ var _ = Describe("ArtistRepository", func() {
 			repo = NewArtistRepository(ctx, GetDBXBuilder())
 		})
 
+		Describe("GetCursor", func() {
+			It("yields the same artists as GetAll", func() {
+				opts := model.QueryOptions{Sort: "name"}
+				want, err := repo.GetAll(opts)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(collectCursor(repo.GetCursor(opts))).To(Equal([]model.Artist(want)))
+			})
+
+			It("honors Max/Offset like GetAll", func() {
+				opts := model.QueryOptions{Sort: "name", Max: 2, Offset: 1}
+				want, err := repo.GetAll(opts)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(collectCursor(repo.GetCursor(opts))).To(Equal([]model.Artist(want)))
+			})
+		})
+
+		Describe("getAllIDs", func() {
+			It("returns the same id set as GetAll", func() {
+				want, err := repo.GetAll()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(want).ToNot(BeEmpty())
+				ids, err := repo.(*artistRepository).getAllIDs()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ids).To(ConsistOf(slice.Map(want, func(a model.Artist) string { return a.ID })))
+			})
+		})
+
 		Describe("Basic Operations", func() {
 			Describe("Count", func() {
 				It("returns the number of artists in the DB", func() {
 					Expect(repo.CountAll()).To(Equal(int64(4)))
+				})
+
+				It("counts starred artists when an annotation filter is present", func() {
+					// The Beatles (id 3) is starred for the admin user in the seed data
+					count, err := repo.CountAll(model.QueryOptions{
+						Filters: annotationBoolFilter("starred")("starred", "true"),
+					})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(count).To(Equal(int64(1)))
+				})
+
+				It("counts with has_rating=false without a 'no such column' error (join kept)", func() {
+					count, err := repo.CountAll(model.QueryOptions{
+						Filters: annotationBoolFilter("rating")("rating", "false"),
+					})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(count).To(Equal(int64(4)))
 				})
 			})
 
@@ -653,6 +818,38 @@ var _ = Describe("ArtistRepository", func() {
 						_, _ = raw.executeSQL(squirrel.Delete(raw.tableName).Where(squirrel.Eq{"id": lib2Artist.ID}))
 					}
 				})
+
+				It("paginates a restricted user's visible artists without gaps", func() {
+					// ID "25" sorts between base fixtures "2" and "3", so this lib2-only artist lands
+					// inside the restricted user's visible range — exercising the no-gap guarantee.
+					lib2Artist := model.Artist{ID: "25", Name: "Restricted Lib2 Artist"}
+					Expect(repo.Put(&lib2Artist)).To(Succeed())
+					Expect(lr.AddArtist(lib2.ID, lib2Artist.ID)).To(Succeed())
+					DeferCleanup(func() {
+						if raw, ok := repo.(*artistRepository); ok {
+							_, _ = raw.executeSQL(squirrel.Delete(raw.tableName).Where(squirrel.Eq{"id": lib2Artist.ID}))
+						}
+					})
+
+					all, err := restrictedRepo.Search("", model.QueryOptions{Max: 1000})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(len(all)).To(BeNumerically(">", 1))
+					for _, a := range all {
+						Expect(a.ID).ToNot(Equal(lib2Artist.ID))
+					}
+
+					var paged model.Artists
+					for offset := range len(all) {
+						page, err := restrictedRepo.Search("", model.QueryOptions{Max: 1, Offset: offset})
+						Expect(err).ToNot(HaveOccurred())
+						Expect(page).To(HaveLen(1), fmt.Sprintf("page at offset %d should be full", offset))
+						paged = append(paged, page...)
+					}
+					Expect(paged).To(HaveLen(len(all)))
+					for i := range all {
+						Expect(paged[i].ID).To(Equal(all[i].ID))
+					}
+				})
 			})
 
 			Context("Headless Processes (No User Context)", func() {
@@ -891,6 +1088,45 @@ var _ = Describe("ArtistRepository", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Expect(idx).To(HaveLen(0))
 			})
+
+			It("takes the unfiltered fast-path when the user can access every library", func() {
+				// The fixture DB has a single library and the user was granted it, so it has access
+				// to all libraries: search results must match what an admin sees.
+				adminRepo := NewArtistRepository(request.WithUser(GinkgoT().Context(), adminUser), GetDBXBuilder())
+				adminAll, err := adminRepo.Search("", model.QueryOptions{Max: 1000})
+				Expect(err).ToNot(HaveOccurred())
+
+				userAll, err := restrictedRepo.Search("", model.QueryOptions{Max: 1000})
+				Expect(err).ToNot(HaveOccurred())
+
+				ids := func(artists model.Artists) []string {
+					out := make([]string, len(artists))
+					for i, a := range artists {
+						out[i] = a.ID
+					}
+					return out
+				}
+				Expect(ids(userAll)).To(Equal(ids(adminAll)))
+				Expect(userAll).ToNot(BeEmpty())
+			})
+
+			It("detects all-library access regardless of result equivalence", func() {
+				// userSeesAllLibraries drives the search fast-path for a non-admin: true when the
+				// visible-library count reaches the DB total. Derive the total from the DB so the
+				// assertion doesn't depend on how many libraries other specs left behind.
+				raw := restrictedRepo.(*artistRepository) // context carries a non-admin user
+				total, err := NewLibraryRepository(GinkgoT().Context(), GetDBXBuilder()).CountAll()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(total).To(BeNumerically(">", 0))
+
+				allLibs := make([]int, total)
+				for i := range allLibs {
+					allLibs[i] = i + 1
+				}
+				Expect(raw.userSeesAllLibraries(allLibs)).To(BeTrue())
+				Expect(raw.userSeesAllLibraries(allLibs[:total-1])).To(BeFalse())
+				Expect(raw.userSeesAllLibraries([]int{})).To(BeFalse())
+			})
 		})
 	})
 
@@ -974,6 +1210,66 @@ var _ = Describe("ArtistRepository", func() {
 			// Image file should still be on disk
 			_, err = os.Stat(imgPath)
 			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Describe("RefreshStats", func() {
+		var repo *artistRepository
+
+		missing := func(id string) bool {
+			var vals []bool
+			Expect(repo.queryAllSlice(squirrel.Select("missing").From("artist").Where(squirrel.Eq{"id": id}), &vals)).To(Succeed())
+			Expect(vals).To(HaveLen(1))
+			return vals[0]
+		}
+
+		BeforeEach(func() {
+			ctx := request.WithUser(GinkgoT().Context(), adminUser)
+			repo = NewArtistRepository(ctx, GetDBXBuilder()).(*artistRepository)
+		})
+
+		It("marks artists missing when the empty-stats cleanup drops their last library_artist row", func() {
+			// A library_artist row with stats '{}' (no content) gets deleted by the cleanup,
+			// which would orphan this non-missing artist.
+			emptyArtist := model.Artist{ID: "refresh-empty", Name: "No Content Artist"}
+			Expect(repo.Put(&emptyArtist)).To(Succeed())
+			_, err := repo.executeSQL(squirrel.Insert("library_artist").
+				SetMap(map[string]any{"library_id": 1, "artist_id": emptyArtist.ID, "stats": "{}"}))
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(func() {
+				_, _ = repo.executeSQL(squirrel.Delete("library_artist").Where(squirrel.Eq{"artist_id": emptyArtist.ID}))
+				_ = repo.delete(squirrel.Eq{"id": emptyArtist.ID})
+			})
+
+			Expect(missing(emptyArtist.ID)).To(BeFalse())
+
+			_, err = repo.RefreshStats(true)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(missing(emptyArtist.ID)).To(BeTrue())
+			var orphanIDs []string
+			Expect(repo.queryAllSlice(squirrel.Select("id").From("artist").
+				Where("missing = false").
+				Where("id not in (select artist_id from library_artist)"), &orphanIDs)).To(Succeed())
+			Expect(orphanIDs).ToNot(ContainElement(emptyArtist.ID))
+		})
+
+		It("heals a pre-existing orphan (no library_artist row) on a full refresh", func() {
+			// A legacy orphan left by an older version: non-missing, with no library_artist row at
+			// all. The cleanup deletes nothing for it, so a full refresh (allArtists) must still
+			// reconcile it.
+			legacyOrphan := model.Artist{ID: "refresh-legacy-orphan", Name: "Legacy Orphan"}
+			Expect(repo.Put(&legacyOrphan)).To(Succeed())
+			DeferCleanup(func() {
+				_ = repo.delete(squirrel.Eq{"id": legacyOrphan.ID})
+			})
+
+			Expect(missing(legacyOrphan.ID)).To(BeFalse())
+
+			_, err := repo.RefreshStats(true)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(missing(legacyOrphan.ID)).To(BeTrue())
 		})
 	})
 })

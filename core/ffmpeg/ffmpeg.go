@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -31,11 +33,12 @@ type TranscodeOptions struct {
 	// transcoding works for non-local (s3://) libraries, whose objects have no local
 	// path. When empty, ffmpeg reads the local FilePath as before.
 	InputURL   string
-	BitRate    int // kbps, 0 = codec default
-	SampleRate int // 0 = no constraint
-	Channels   int // 0 = no constraint
-	BitDepth   int // 0 = no constraint; valid values: 16, 24, 32
-	Offset     int // seconds
+	BitRate    int     // kbps, 0 = codec default
+	SampleRate int     // 0 = no constraint
+	Channels   int     // 0 = no constraint
+	BitDepth   int     // 0 = no constraint; valid values: 16, 24, 32
+	Offset     int     // seconds
+	Duration   float32 // seconds; 0 = unknown. Only used to repair a piped FLAC header.
 }
 
 // input returns the ffmpeg input argument: the presigned URL when set, otherwise the
@@ -81,7 +84,7 @@ var ErrAnimatedWebPUnsupported = errors.New("ffmpeg lacks libwebp_anim encoder â
 const (
 	extractImageCmd     = "ffmpeg -i %s -map 0:v -map -0:V -vcodec copy -f image2pipe -"
 	probeCmd            = "ffmpeg %s -f ffmetadata"
-	probeAudioStreamCmd = "ffprobe -v quiet -select_streams a:0 -print_format json -show_streams -show_format %s"
+	probeAudioStreamCmd = "ffprobe -v error -select_streams a:0 -print_format json -show_streams -show_format %s"
 )
 
 type ffmpeg struct{}
@@ -104,7 +107,11 @@ func (e *ffmpeg) Transcode(ctx context.Context, opts TranscodeOptions) (io.ReadC
 	} else {
 		args = buildTemplateArgs(opts)
 	}
-	return e.start(ctx, args)
+	out, err := e.start(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	return patchFLACDuration(out, opts.Duration-float32(opts.Offset)), nil
 }
 
 func (e *ffmpeg) ConvertAnimatedImage(ctx context.Context, reader io.Reader, maxSize int, quality int) (io.ReadCloser, error) {
@@ -160,6 +167,68 @@ func isRemoteInput(input string) bool {
 	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
 }
 
+// Remote (presigned s3) inputs are fetched by ffmpeg itself, and ffmpeg auto-detects the
+// format of whatever the object turns out to be. An uploaded HLS/concat/ffconcat playlist
+// would make it fetch further URLs (in-cluster services, file:// paths) on our behalf. So a
+// remote input is pinned to plain HTTP(S) transport and to audio container demuxers: hls,
+// concat, image2 and friends are refused before they open anything. A demuxer matches if any
+// of its comma-separated names is listed (e.g. "mov" covers "mov,mp4,m4a,3gp,3g2,mj2").
+const (
+	remoteProtocolWhitelist = "http,https,tcp,tls"
+	remoteFormatWhitelist   = "mp3,flac,ogg,mov,aac,loas,wav,w64,aiff,caf,au,asf,ape,wv,dsf,iff," +
+		"mpc,mpc8,tta,tak,shn,matroska,amr,ac3,eac3,dts,truehd,mlp"
+)
+
+// guardRemoteInputs inserts the remote-input whitelists in front of every http(s) input in
+// an ffmpeg/ffprobe argument list: before its "-i" flag for ffmpeg, or before the bare
+// positional input for ffprobe. Local inputs are left untouched.
+func guardRemoteInputs(args []string) []string {
+	out := make([]string, 0, len(args)+4)
+	for i, a := range args {
+		if isRemoteInput(a) {
+			guard := []string{"-protocol_whitelist", remoteProtocolWhitelist, "-format_whitelist", remoteFormatWhitelist}
+			if i > 0 && args[i-1] == "-i" {
+				out = append(out[:len(out)-1], guard...)
+				out = append(out, "-i")
+			} else {
+				out = append(out, guard...)
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// presignedQuery matches the query string of an http(s) URL. For a presigned S3 URL that is
+// where the credential lives (X-Amz-Credential, X-Amz-Signature), so it is cut from anything
+// that reaches a log line or an error message.
+// Query values in a presigned URL are percent-encoded, so the match stops at a ':' and
+// keeps ffmpeg's "<url>: <message>" separator intact.
+var presignedQuery = regexp.MustCompile(`(https?://[^\s"'?]*)\?[^\s"':]*`)
+
+// RedactURLs strips the query string from every http(s) URL in s, keeping scheme, host and
+// path so a log line still says which object was involved.
+func RedactURLs(s string) string {
+	return presignedQuery.ReplaceAllString(s, "${1}?<redacted>")
+}
+
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = RedactURLs(a)
+	}
+	return out
+}
+
+func hasRemoteInput(args []string) bool {
+	for _, a := range args {
+		if isRemoteInput(a) {
+			return true
+		}
+	}
+	return false
+}
+
 func fileExists(path string) error {
 	s, err := os.Stat(path)
 	if err != nil {
@@ -186,17 +255,85 @@ func (e *ffmpeg) ProbeAudioStream(ctx context.Context, filePath string) (*AudioP
 	if _, err := ffmpegCmd(); err != nil {
 		return nil, err
 	}
-	if err := fileExists(filePath); err != nil {
-		return nil, err
+	// A presigned URL (s3:// library) has no local file to stat; ffprobe fetches it directly.
+	if !isRemoteInput(filePath) {
+		if err := fileExists(filePath); err != nil {
+			return nil, &ProbeError{Path: filePath, Reason: fileAccessReason(err),
+				NotFound: errors.Is(err, fs.ErrNotExist), err: err}
+		}
 	}
-	args := createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0)
-	log.Trace(ctx, "Executing ffprobe command", "args", args)
+	args := guardRemoteInputs(createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0))
+	log.Trace(ctx, "Executing ffprobe command", "args", redactArgs(args))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) // #nosec
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("running ffprobe on %q: %w", filePath, err)
+		return nil, &ProbeError{Path: filePath, Reason: probeClientReason(err, filePath), err: err}
 	}
-	return parseProbeOutput(output)
+	result, err := parseProbeOutput(output)
+	if err != nil {
+		return nil, &ProbeError{Path: filePath, Reason: err.Error(), err: err}
+	}
+	return result, nil
+}
+
+// ProbeError reports an ffprobe failure. Reason is a path-free message safe to
+// expose to clients; the wrapped cause carries the full detail for logging.
+// NotFound marks the media file itself as missing â€” a launch failure of a
+// deleted ffprobe binary also wraps fs.ErrNotExist, so callers must not infer
+// it from the error chain.
+type ProbeError struct {
+	Path     string
+	Reason   string
+	NotFound bool
+	err      error
+}
+
+func (e *ProbeError) Error() string {
+	// Path may be a presigned URL, and ffprobe's stderr echoes it: redact both.
+	if e.err == nil {
+		return fmt.Sprintf("probe failed on %q: %s", RedactURLs(e.Path), RedactURLs(e.Reason))
+	}
+	return fmt.Sprintf("probe failed on %q: %s", RedactURLs(e.Path), RedactURLs(probeDetail(e.err)))
+}
+
+// Unwrap exposes the underlying cause so callers can test it with errors.Is
+// (e.g. fs.ErrNotExist to detect a missing file).
+func (e *ProbeError) Unwrap() error { return e.err }
+
+// SafeReason returns the path-free reason, safe to send to clients.
+func (e *ProbeError) SafeReason() string { return e.Reason }
+
+// fileAccessReason maps a stat failure to a clear, path-free reason, so a moved
+// or unreadable file reads as "file not found" rather than a raw ffprobe message.
+func fileAccessReason(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "file not found"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	default:
+		return "file not accessible"
+	}
+}
+
+// probeDetail returns the full diagnostic for logging (may contain paths):
+// ffprobe's stderr when present, otherwise the raw error text.
+func probeDetail(err error) string {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && len(exitErr.Stderr) > 0 {
+		return strings.TrimSpace(string(exitErr.Stderr))
+	}
+	return err.Error()
+}
+
+// probeClientReason returns a path-free reason for an ffprobe execution failure:
+// ffprobe's stderr with the file path stripped, or a generic reason when ffprobe
+// couldn't run at all (its launch error may embed the binary path).
+func probeClientReason(err error, path string) string {
+	exitErr, ok := errors.AsType[*exec.ExitError](err)
+	if !ok || len(exitErr.Stderr) == 0 {
+		return "could not read file"
+	}
+	return RedactURLs(strings.TrimSpace(strings.ReplaceAll(string(exitErr.Stderr), path, "the file")))
 }
 
 type probeOutput struct {
@@ -308,7 +445,8 @@ func (e *ffmpeg) Version() string {
 }
 
 func (e *ffmpeg) start(ctx context.Context, args []string, input ...io.Reader) (io.ReadCloser, error) {
-	log.Trace(ctx, "Executing ffmpeg command", "cmd", args)
+	args = guardRemoteInputs(args)
+	log.Trace(ctx, "Executing ffmpeg command", "cmd", redactArgs(args))
 	j := &ffCmd{args: args}
 	if len(input) > 0 {
 		j.input = input[0]
@@ -339,7 +477,9 @@ func (j *ffCmd) start(ctx context.Context) error {
 	}
 	j.stderr = &bytes.Buffer{}
 	stderrWriter := &limitedWriter{buf: j.stderr, limit: 4096}
-	if log.IsGreaterOrEqualTo(log.LevelTrace) {
+	// Trace mode tees raw stderr to the process stderr; never for a remote input, whose
+	// presigned URL ffmpeg echoes there unredacted.
+	if log.IsGreaterOrEqualTo(log.LevelTrace) && !hasRemoteInput(j.args) {
 		cmd.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
 	} else {
 		cmd.Stderr = stderrWriter
@@ -356,7 +496,7 @@ func (j *ffCmd) wait() {
 	if err := j.cmd.Wait(); err != nil {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			errMsg := fmt.Sprintf("%s exited with non-zero status code: %d", j.args[0], exitErr.ExitCode())
-			if stderrOutput := strings.TrimSpace(j.stderr.String()); stderrOutput != "" {
+			if stderrOutput := RedactURLs(strings.TrimSpace(j.stderr.String())); stderrOutput != "" {
 				errMsg += ": " + stderrOutput
 			}
 			_ = j.out.CloseWithError(errors.New(errMsg))
@@ -430,6 +570,14 @@ func buildDynamicArgs(opts TranscodeOptions) []string {
 
 	args = append(args, "-i", opts.input())
 	args = append(args, "-map", "0:a:0")
+
+	// Preserve source tags. -map_metadata 0 copies format-level tags (MP3/FLAC);
+	// -map_metadata 0:s:a:0 copies tags from the first audio stream (OPUS/OGG).
+	// Both are needed because the two source families store tags at different
+	// levels. Targeting the audio stream explicitly (s:a:0 rather than s:0) avoids
+	// pulling metadata from an embedded cover-art/video stream at index 0. Note:
+	// adts (AAC) output cannot hold tags, so these are a no-op there.
+	args = append(args, "-map_metadata", "0", "-map_metadata", "0:s:a:0")
 
 	if codec, ok := formatCodecMap[opts.Format]; ok {
 		args = append(args, "-c:a", codec)

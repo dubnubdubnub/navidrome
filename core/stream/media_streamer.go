@@ -109,7 +109,7 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 	// For non-local libraries (e.g. s3://) ffmpeg cannot read the file from disk; obtain a
 	// presigned URL to hand it as input. This is best-effort: a local (file://) library has
 	// no URLProvider and inputURL stays empty, so the transcoder falls back to filePath.
-	inputURL, err := presignedInputURL(ctx, mf)
+	inputURL, err := presignedInputURL(ctx, mf, transcodePresignExpiry)
 	if err != nil {
 		return nil, err
 	}
@@ -169,8 +169,9 @@ func (s *Stream) EstimatedContentLength() int {
 
 // Serve writes the stream to the HTTP response. For seekable streams it uses http.ServeContent
 // (supporting range requests). For non-seekable streams it writes directly and logs any errors.
-// Returns the number of bytes written and an error only when io.Copy fails with 0 bytes written
+// Returns the number of bytes written and an error only when it fails with 0 bytes written
 // (meaning the HTTP 200 status has not been flushed yet and the caller can still send an error response).
+// Once bytes are on the wire it panics with http.ErrAbortHandler instead, aborting the response.
 // Empty output (0 bytes, no error) is logged but not treated as an error.
 func (s *Stream) Serve(ctx context.Context, w http.ResponseWriter, r *http.Request) (int64, error) {
 	if s.Seekable() {
@@ -200,7 +201,8 @@ func (s *Stream) Serve(ctx context.Context, w http.ResponseWriter, r *http.Reque
 			w.Header().Del("Content-Length")
 			return 0, fmt.Errorf("sending transcoded file: %w", err)
 		}
-		return c, nil
+		// The 200 is already sent, so dropping the connection is the only way to say "truncated".
+		panic(http.ErrAbortHandler)
 	}
 	if c == 0 {
 		log.Error(ctx, "Transcoding returned empty output, ffmpeg may have failed. "+
@@ -284,6 +286,7 @@ func NewTranscodingCache() TranscodingCache {
 				BitDepth:   job.bitDepth,
 				Channels:   job.channels,
 				Offset:     job.offset,
+				Duration:   job.mf.Duration,
 			})
 			if err != nil {
 				release()
@@ -314,11 +317,21 @@ func openMediaFile(mf *model.MediaFile) (io.ReadCloser, error) {
 	return fsys.Open(mf.Path)
 }
 
+// Presigned URLs are bearer credentials, so each use asks for the shortest expiry that
+// covers its read. A transcode is the long one: with the transcoding cache disabled (or a
+// cache miss streamed live) ffmpeg's reads are paced by the client's playback, and ffmpeg
+// re-requests the URL when it reconnects or seeks, so the URL has to outlast the longest
+// track. A probe reads the container header once.
+const (
+	transcodePresignExpiry = 6 * time.Hour
+	probePresignExpiry     = 5 * time.Minute
+)
+
 // presignedInputURL returns a presigned HTTP URL for the media file's bytes when the
 // library's storage backend supports it (implements storage.URLProvider, e.g. s3://).
 // For local (file://) libraries the backend does not implement URLProvider and this
 // returns "", nil so the caller falls back to the local file path.
-func presignedInputURL(ctx context.Context, mf *model.MediaFile) (string, error) {
+func presignedInputURL(ctx context.Context, mf *model.MediaFile, expiry time.Duration) (string, error) {
 	st, err := storage.For(mf.LibraryPath)
 	if err != nil {
 		return "", err
@@ -331,7 +344,7 @@ func presignedInputURL(ctx context.Context, mf *model.MediaFile) (string, error)
 	if !ok {
 		return "", nil
 	}
-	return up.PresignedURL(ctx, mf.Path)
+	return up.PresignedURL(ctx, mf.Path, expiry)
 }
 
 // userName extracts the username from the context for logging purposes.

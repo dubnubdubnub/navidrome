@@ -53,6 +53,16 @@ func (sfs *s3FS) Stat(name string) (fs.FileInfo, error) {
 		return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrInvalid}
 	}
 	if name == "." {
+		// The root of a library is the bucket itself. Ask the server rather than assume it
+		// exists: library validation and the scanner rely on Stat(".") failing for a missing
+		// bucket or an unreachable endpoint, not reading as an empty library.
+		ok, err := sfs.client.BucketExists(sfs.ctx(), sfs.bucket)
+		if err != nil {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: err}
+		}
+		if !ok {
+			return nil, &fs.PathError{Op: "stat", Path: name, Err: fs.ErrNotExist}
+		}
 		return &s3FileInfo{name: ".", dir: true}, nil
 	}
 	oi, err := sfs.client.StatObject(sfs.ctx(), sfs.bucket, name, minio.StatObjectOptions{})

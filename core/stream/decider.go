@@ -12,6 +12,7 @@ import (
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
+	"github.com/navidrome/navidrome/utils/gg"
 )
 
 const fallbackBitrate = 256 // kbps
@@ -22,6 +23,7 @@ type TranscodeDecider interface {
 	CreateTranscodeParams(decision *TranscodeDecision) (string, error)
 	ResolveRequestFromToken(ctx context.Context, token string, mf *model.MediaFile, offset int) (Request, error)
 	ResolveRequest(ctx context.Context, mf *model.MediaFile, reqFormat string, reqBitRate int, offset int) Request
+	ResolveClientRequest(ctx context.Context, mf *model.MediaFile, clientInfo *ClientInfo, offset int) Request
 }
 
 func NewTranscodeDecider(ds model.DataStore, ff ffmpeg.FFmpeg) TranscodeDecider {
@@ -142,7 +144,7 @@ func buildSourceStream(mf *model.MediaFile, probe *ffmpeg.AudioProbeResult) Deta
 		sd.Codec = mf.AudioCodec()
 		sd.Bitrate = mf.BitRate
 		sd.SampleRate = mf.SampleRate
-		sd.BitDepth = mf.BitDepth
+		sd.BitDepth = gg.V(mf.BitDepth)
 		sd.Channels = mf.Channels
 	}
 	sd.IsLossless = isLosslessFormat(sd.Codec)
@@ -268,7 +270,7 @@ func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Detai
 		Codec:      strings.ToLower(profile.AudioCodec),
 		SampleRate: normalizeSourceSampleRate(src.SampleRate, src.Codec),
 		Channels:   src.Channels,
-		BitDepth:   normalizeSourceBitDepth(src.BitDepth, src.Codec),
+		BitDepth:   targetBitDepth(src.BitDepth, src.Codec, targetIsLossless),
 		IsLossless: targetIsLossless,
 	}
 	if ts.Codec == "" {
@@ -423,6 +425,20 @@ func (s *deciderService) applyCodecLimitations(ctx context.Context, sourceBitrat
 	return true
 }
 
+// probeInput is what ffprobe reads for a media file: a presigned URL for a library whose
+// backend serves files over HTTP (s3://, which has no local path to probe), else the
+// on-disk path. Bare-path libraries skip the storage lookup entirely.
+func probeInput(ctx context.Context, mf *model.MediaFile) (string, error) {
+	if !strings.Contains(mf.LibraryPath, "://") {
+		return mf.AbsolutePath(), nil
+	}
+	u, err := presignedInputURL(ctx, mf, probePresignExpiry)
+	if err != nil || u == "" {
+		return mf.AbsolutePath(), err
+	}
+	return u, nil
+}
+
 // ensureProbed runs ffprobe if probe data is missing, persists it, and returns
 // the parsed result. Returns (nil, nil) when probing is skipped or data already exists
 // (in which case the caller should parse mf.ProbeData).
@@ -434,7 +450,11 @@ func (s *deciderService) ensureProbed(ctx context.Context, mf *model.MediaFile) 
 		return nil, nil
 	}
 
-	result, err := s.ff.ProbeAudioStream(ctx, mf.AbsolutePath())
+	input, err := probeInput(ctx, mf)
+	if err != nil {
+		return nil, fmt.Errorf("probing media file %s: %w", mf.ID, err)
+	}
+	result, err := s.ff.ProbeAudioStream(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("probing media file %s: %w", mf.ID, err)
 	}
