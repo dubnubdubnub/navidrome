@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -166,6 +167,68 @@ func isRemoteInput(input string) bool {
 	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
 }
 
+// Remote (presigned s3) inputs are fetched by ffmpeg itself, and ffmpeg auto-detects the
+// format of whatever the object turns out to be. An uploaded HLS/concat/ffconcat playlist
+// would make it fetch further URLs (in-cluster services, file:// paths) on our behalf. So a
+// remote input is pinned to plain HTTP(S) transport and to audio container demuxers: hls,
+// concat, image2 and friends are refused before they open anything. A demuxer matches if any
+// of its comma-separated names is listed (e.g. "mov" covers "mov,mp4,m4a,3gp,3g2,mj2").
+const (
+	remoteProtocolWhitelist = "http,https,tcp,tls"
+	remoteFormatWhitelist   = "mp3,flac,ogg,mov,aac,loas,wav,w64,aiff,caf,au,asf,ape,wv,dsf,iff," +
+		"mpc,mpc8,tta,tak,shn,matroska,amr,ac3,eac3,dts,truehd,mlp"
+)
+
+// guardRemoteInputs inserts the remote-input whitelists in front of every http(s) input in
+// an ffmpeg/ffprobe argument list: before its "-i" flag for ffmpeg, or before the bare
+// positional input for ffprobe. Local inputs are left untouched.
+func guardRemoteInputs(args []string) []string {
+	out := make([]string, 0, len(args)+4)
+	for i, a := range args {
+		if isRemoteInput(a) {
+			guard := []string{"-protocol_whitelist", remoteProtocolWhitelist, "-format_whitelist", remoteFormatWhitelist}
+			if i > 0 && args[i-1] == "-i" {
+				out = append(out[:len(out)-1], guard...)
+				out = append(out, "-i")
+			} else {
+				out = append(out, guard...)
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// presignedQuery matches the query string of an http(s) URL. For a presigned S3 URL that is
+// where the credential lives (X-Amz-Credential, X-Amz-Signature), so it is cut from anything
+// that reaches a log line or an error message.
+// Query values in a presigned URL are percent-encoded, so the match stops at a ':' and
+// keeps ffmpeg's "<url>: <message>" separator intact.
+var presignedQuery = regexp.MustCompile(`(https?://[^\s"'?]*)\?[^\s"':]*`)
+
+// RedactURLs strips the query string from every http(s) URL in s, keeping scheme, host and
+// path so a log line still says which object was involved.
+func RedactURLs(s string) string {
+	return presignedQuery.ReplaceAllString(s, "${1}?<redacted>")
+}
+
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = RedactURLs(a)
+	}
+	return out
+}
+
+func hasRemoteInput(args []string) bool {
+	for _, a := range args {
+		if isRemoteInput(a) {
+			return true
+		}
+	}
+	return false
+}
+
 func fileExists(path string) error {
 	s, err := os.Stat(path)
 	if err != nil {
@@ -199,8 +262,8 @@ func (e *ffmpeg) ProbeAudioStream(ctx context.Context, filePath string) (*AudioP
 				NotFound: errors.Is(err, fs.ErrNotExist), err: err}
 		}
 	}
-	args := createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0)
-	log.Trace(ctx, "Executing ffprobe command", "args", args)
+	args := guardRemoteInputs(createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0))
+	log.Trace(ctx, "Executing ffprobe command", "args", redactArgs(args))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) // #nosec
 	output, err := cmd.Output()
 	if err != nil {
@@ -226,10 +289,11 @@ type ProbeError struct {
 }
 
 func (e *ProbeError) Error() string {
+	// Path may be a presigned URL, and ffprobe's stderr echoes it: redact both.
 	if e.err == nil {
-		return fmt.Sprintf("probe failed on %q: %s", e.Path, e.Reason)
+		return fmt.Sprintf("probe failed on %q: %s", RedactURLs(e.Path), RedactURLs(e.Reason))
 	}
-	return fmt.Sprintf("probe failed on %q: %s", e.Path, probeDetail(e.err))
+	return fmt.Sprintf("probe failed on %q: %s", RedactURLs(e.Path), RedactURLs(probeDetail(e.err)))
 }
 
 // Unwrap exposes the underlying cause so callers can test it with errors.Is
@@ -269,7 +333,7 @@ func probeClientReason(err error, path string) string {
 	if !ok || len(exitErr.Stderr) == 0 {
 		return "could not read file"
 	}
-	return strings.TrimSpace(strings.ReplaceAll(string(exitErr.Stderr), path, "the file"))
+	return RedactURLs(strings.TrimSpace(strings.ReplaceAll(string(exitErr.Stderr), path, "the file")))
 }
 
 type probeOutput struct {
@@ -381,7 +445,8 @@ func (e *ffmpeg) Version() string {
 }
 
 func (e *ffmpeg) start(ctx context.Context, args []string, input ...io.Reader) (io.ReadCloser, error) {
-	log.Trace(ctx, "Executing ffmpeg command", "cmd", args)
+	args = guardRemoteInputs(args)
+	log.Trace(ctx, "Executing ffmpeg command", "cmd", redactArgs(args))
 	j := &ffCmd{args: args}
 	if len(input) > 0 {
 		j.input = input[0]
@@ -412,7 +477,9 @@ func (j *ffCmd) start(ctx context.Context) error {
 	}
 	j.stderr = &bytes.Buffer{}
 	stderrWriter := &limitedWriter{buf: j.stderr, limit: 4096}
-	if log.IsGreaterOrEqualTo(log.LevelTrace) {
+	// Trace mode tees raw stderr to the process stderr; never for a remote input, whose
+	// presigned URL ffmpeg echoes there unredacted.
+	if log.IsGreaterOrEqualTo(log.LevelTrace) && !hasRemoteInput(j.args) {
 		cmd.Stderr = io.MultiWriter(os.Stderr, stderrWriter)
 	} else {
 		cmd.Stderr = stderrWriter
@@ -429,7 +496,7 @@ func (j *ffCmd) wait() {
 	if err := j.cmd.Wait(); err != nil {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			errMsg := fmt.Sprintf("%s exited with non-zero status code: %d", j.args[0], exitErr.ExitCode())
-			if stderrOutput := strings.TrimSpace(j.stderr.String()); stderrOutput != "" {
+			if stderrOutput := RedactURLs(strings.TrimSpace(j.stderr.String())); stderrOutput != "" {
 				errMsg += ": " + stderrOutput
 			}
 			_ = j.out.CloseWithError(errors.New(errMsg))
