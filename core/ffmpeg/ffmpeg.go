@@ -100,11 +100,9 @@ func (e *ffmpeg) Transcode(ctx context.Context, opts TranscodeOptions) (io.ReadC
 			return nil, err
 		}
 	}
-	var args []string
-	if isDefaultCommand(opts.Format, opts.Command) {
-		args = buildDynamicArgs(opts)
-	} else {
-		args = buildTemplateArgs(opts)
+	args, err := transcodeArgs(opts)
+	if err != nil {
+		return nil, err
 	}
 	out, err := e.start(ctx, args)
 	if err != nil {
@@ -157,13 +155,33 @@ func (e *ffmpeg) ExtractImage(ctx context.Context, path string) (io.ReadCloser, 
 			return nil, err
 		}
 	}
-	args := createFFmpegCommand(extractImageCmd, path, 0, 0)
+	args, err := extractImageArgs(path)
+	if err != nil {
+		return nil, err
+	}
 	return e.start(ctx, args)
 }
 
-// isRemoteInput reports whether the ffmpeg input is an http(s) URL rather than a local path.
-func isRemoteInput(input string) bool {
-	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
+// transcodeArgs builds the transcode command line; a remote input gets its demuxer and
+// protocols pinned (guardRemoteInput).
+func transcodeArgs(opts TranscodeOptions) ([]string, error) {
+	var args []string
+	if isDefaultCommand(opts.Format, opts.Command) {
+		args = buildDynamicArgs(opts)
+	} else {
+		args = buildTemplateArgs(opts)
+	}
+	return guardRemoteInput(args, opts.input())
+}
+
+// extractImageArgs builds the embedded-art extraction command line (see transcodeArgs).
+func extractImageArgs(path string) ([]string, error) {
+	return guardRemoteInput(createFFmpegCommand(extractImageCmd, path, 0, 0), path)
+}
+
+// probeAudioStreamArgs builds the ffprobe command line (see transcodeArgs).
+func probeAudioStreamArgs(path string) ([]string, error) {
+	return guardRemoteInput(createFFmpegCommand(probeAudioStreamCmd, path, 0, 0), path)
 }
 
 func fileExists(path string) error {
@@ -182,7 +200,7 @@ func (e *ffmpeg) Probe(ctx context.Context, files []string) (string, error) {
 		return "", err
 	}
 	args := createProbeCommand(probeCmd, files)
-	log.Trace(ctx, "Executing ffmpeg command", "args", args)
+	log.Trace(ctx, "Executing ffmpeg command", "args", redactArgs(args))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) // #nosec
 	output, _ := cmd.CombinedOutput()
 	return string(output), nil
@@ -195,20 +213,23 @@ func (e *ffmpeg) ProbeAudioStream(ctx context.Context, filePath string) (*AudioP
 	// A presigned URL (s3:// library) has no local file to stat; ffprobe fetches it directly.
 	if !isRemoteInput(filePath) {
 		if err := fileExists(filePath); err != nil {
-			return nil, &ProbeError{Path: filePath, Reason: fileAccessReason(err),
+			return nil, &ProbeError{Path: Redact(filePath), Reason: fileAccessReason(err),
 				NotFound: errors.Is(err, fs.ErrNotExist), err: err}
 		}
 	}
-	args := createFFmpegCommand(probeAudioStreamCmd, filePath, 0, 0)
-	log.Trace(ctx, "Executing ffprobe command", "args", args)
+	args, err := probeAudioStreamArgs(filePath)
+	if err != nil {
+		return nil, &ProbeError{Path: Redact(filePath), Reason: "unsupported remote input", err: err}
+	}
+	log.Trace(ctx, "Executing ffprobe command", "args", redactArgs(args))
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) // #nosec
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, &ProbeError{Path: filePath, Reason: probeClientReason(err, filePath), err: err}
+		return nil, &ProbeError{Path: Redact(filePath), Reason: probeClientReason(err, filePath), err: err}
 	}
 	result, err := parseProbeOutput(output)
 	if err != nil {
-		return nil, &ProbeError{Path: filePath, Reason: err.Error(), err: err}
+		return nil, &ProbeError{Path: Redact(filePath), Reason: err.Error(), err: err}
 	}
 	return result, nil
 }
@@ -225,11 +246,13 @@ type ProbeError struct {
 	err      error
 }
 
+// Error redacts presigned-URL credentials (X-Amz-*) wherever they appear: a remote input's
+// Path, and ffprobe's stderr, which echoes the URL it failed to open.
 func (e *ProbeError) Error() string {
 	if e.err == nil {
-		return fmt.Sprintf("probe failed on %q: %s", e.Path, e.Reason)
+		return Redact(fmt.Sprintf("probe failed on %q: %s", e.Path, e.Reason))
 	}
-	return fmt.Sprintf("probe failed on %q: %s", e.Path, probeDetail(e.err))
+	return Redact(fmt.Sprintf("probe failed on %q: %s", e.Path, probeDetail(e.err)))
 }
 
 // Unwrap exposes the underlying cause so callers can test it with errors.Is
@@ -269,7 +292,7 @@ func probeClientReason(err error, path string) string {
 	if !ok || len(exitErr.Stderr) == 0 {
 		return "could not read file"
 	}
-	return strings.TrimSpace(strings.ReplaceAll(string(exitErr.Stderr), path, "the file"))
+	return Redact(strings.TrimSpace(strings.ReplaceAll(string(exitErr.Stderr), path, "the file")))
 }
 
 type probeOutput struct {
@@ -381,7 +404,7 @@ func (e *ffmpeg) Version() string {
 }
 
 func (e *ffmpeg) start(ctx context.Context, args []string, input ...io.Reader) (io.ReadCloser, error) {
-	log.Trace(ctx, "Executing ffmpeg command", "cmd", args)
+	log.Trace(ctx, "Executing ffmpeg command", "cmd", redactArgs(args))
 	j := &ffCmd{args: args}
 	if len(input) > 0 {
 		j.input = input[0]
@@ -430,7 +453,7 @@ func (j *ffCmd) wait() {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			errMsg := fmt.Sprintf("%s exited with non-zero status code: %d", j.args[0], exitErr.ExitCode())
 			if stderrOutput := strings.TrimSpace(j.stderr.String()); stderrOutput != "" {
-				errMsg += ": " + stderrOutput
+				errMsg += ": " + Redact(stderrOutput)
 			}
 			_ = j.out.CloseWithError(errors.New(errMsg))
 		} else {
