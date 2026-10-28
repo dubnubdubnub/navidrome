@@ -331,7 +331,9 @@ func isLocalSource(source string) bool {
 // placeBytes reports the item's backing-file provenance and writes the bytes into the store
 // for the sources that have none.
 func placeBytes(store *ImageStore, art *model.Artwork, res resolution, data []byte) (sourcePath string, refMtime int64, err error) {
-	if isFileBacked(res.source) {
+	// A folder image from a remote (s3://) library has no local sourcePath: there is no file
+	// to serve it from later, so it is stored like any other store-backed source.
+	if isFileBacked(res.source) && res.sourcePath != "" {
 		return res.sourcePath, res.refMtime, nil
 	}
 	if res.source == "embedded" {

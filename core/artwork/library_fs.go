@@ -16,6 +16,10 @@ import (
 type libraryView struct {
 	FS      storage.MusicFS
 	absRoot string
+	// remote is true for libraries whose files are not on the local filesystem (s3://, see
+	// isRemoteFS). Their paths cannot be os.Open'd/os.Stat'd later, so the artwork store
+	// must not record them as a backing file; see localPath.
+	remote bool
 }
 
 // Abs returns the absolute path for a library-relative path. Returns "" for an
@@ -25,6 +29,25 @@ func (v libraryView) Abs(rel string) string {
 		return ""
 	}
 	return filepath.Join(v.absRoot, rel)
+}
+
+// isRemoteFS reports whether a library's files live behind a URL rather than on the local
+// filesystem. The URLProvider capability is the marker: it is what s3:// implements so ffmpeg
+// can be handed a presigned URL, and local backends deliberately do not implement it.
+func isRemoteFS(fsys storage.MusicFS) bool {
+	_, ok := fsys.(storage.URLProvider)
+	return ok
+}
+
+// localPath returns the on-disk path the artwork store may later os.Open/os.Stat for a
+// library-relative path, or "" when the library is not on the local filesystem (s3://).
+// An empty result makes the resolution store-backed: its bytes are copied into the image
+// store and there is no backing file whose mtime could be re-checked.
+func (v libraryView) localPath(rel string) string {
+	if v.remote {
+		return ""
+	}
+	return v.Abs(rel)
 }
 
 // ffmpegInput returns the input ffmpeg should read for the given library-relative path:
@@ -61,7 +84,7 @@ func loadLibraryView(ctx context.Context, ds model.DataStore, libID int) (librar
 	if err != nil {
 		return libraryView{}, err
 	}
-	return libraryView{FS: fs, absRoot: localOSRoot(lib.Path)}, nil
+	return libraryView{FS: fs, absRoot: localOSRoot(lib.Path), remote: isRemoteFS(fs)}, nil
 }
 
 // localOSRoot maps a library path to its on-disk root so Abs() yields paths os.Open/os.Stat accept:

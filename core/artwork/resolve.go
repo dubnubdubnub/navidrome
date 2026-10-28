@@ -511,12 +511,14 @@ func resolveEmbedded(ctx context.Context, lib libraryView, ffm ffmpeg.FFmpeg, em
 	if embedRel == "" {
 		return resolution{}, false
 	}
-	abs := lib.Abs(embedRel)
+	// sourcePath/refMtime are re-checked later with os.Stat, so a remote (s3://) library
+	// records neither: its embedded art is served from the image store as-is.
+	src := lib.localPath(embedRel)
 	var unreadable bool
 	for _, sf := range []sourceFunc{fromTag(ctx, lib.FS, embedRel), fromFFmpegTag(ctx, ffm, lib.ffmpegInput(ctx, embedRel))} {
 		r, _, err := sf()
 		if r != nil {
-			return resolution{reader: r, source: "embedded", sourcePath: abs, refMtime: mtimeViaFS(lib.FS, embedRel)}, true
+			return resolution{reader: r, source: "embedded", sourcePath: src, refMtime: localMtime(lib, src, embedRel)}, true
 		}
 		unreadable = unreadable || errors.Is(err, errSourceUnreadable)
 	}
@@ -530,7 +532,19 @@ func resolveFolderSource(lib libraryView, sf sourceFunc) (resolution, bool) {
 	if r == nil {
 		return resolution{localError: errors.Is(err, errSourceUnreadable)}, false
 	}
-	return resolution{reader: r, source: "folder", sourcePath: lib.Abs(path), refMtime: mtimeViaFS(lib.FS, path)}, true
+	// A remote (s3://) folder image has no local path for openOriginal to os.Open later, so it
+	// is recorded with an empty sourcePath and placeBytes copies its bytes into the store.
+	src := lib.localPath(path)
+	return resolution{reader: r, source: "folder", sourcePath: src, refMtime: localMtime(lib, src, path)}, true
+}
+
+// localMtime is mtimeViaFS for a resolution that has a local backing file, and 0 when it has
+// none (remote library): refMtime is only ever compared against os.Stat(sourcePath).
+func localMtime(lib libraryView, sourcePath, rel string) int64 {
+	if sourcePath == "" {
+		return 0
+	}
+	return mtimeViaFS(lib.FS, rel)
 }
 
 func resolveFolderFile(ctx context.Context, lib libraryView, imgFiles []string, pattern string) (resolution, bool) {
