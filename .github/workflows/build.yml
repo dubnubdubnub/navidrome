@@ -71,7 +71,7 @@ jobs:
       - name: ffmpeg suite against bookworm ffmpeg
         env:
           ND_TEST_REQUIRE_FFMPEG: "1"
-        run: go test -count=1 -tags netgo,sqlite_fts5 ./core/ffmpeg/ -ginkgo.v
+        run: go test -v -count=1 -tags netgo,sqlite_fts5 ./core/ffmpeg/ -ginkgo.v
 
   build:
     needs: [test, ffmpeg-bookworm]
