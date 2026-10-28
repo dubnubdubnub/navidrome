@@ -223,10 +223,16 @@ func (w s3FileInfoWrapper) BirthTime() time.Time {
 
 func (sfs *s3FS) ctx() context.Context { return context.Background() }
 
-// presignedURLExpiry is how long a presigned GET URL stays valid. It needs to comfortably
-// outlast a single transcode/stream of one track, but be short enough that a leaked URL is
-// of limited use.
-const presignedURLExpiry = 6 * time.Hour
+// presignedURLExpiry is how long a presigned GET URL stays valid. S3 checks the signature
+// when a request starts, not while its body streams, and every consumer presigns afresh
+// per use: each transcode/probe/art extraction (a seek restarts the transcode with a new
+// URL), while raw streaming and ranged seeks never use a URL at all (they read through the
+// FS). So the URL only has to outlive ffmpeg's opening requests, including the extra
+// range GETs a demuxer makes up front (e.g. an MP4 whose moov atom is at the end). An hour
+// leaves a wide margin for that while keeping a leaked URL short-lived. The one thing it
+// does not cover is ffmpeg re-requesting the URL more than an hour into a single
+// transcode, which it does not do without -reconnect.
+const presignedURLExpiry = time.Hour
 
 // PresignedURL implements storage.URLProvider. It returns a time-limited HTTP(S) URL that
 // grants read access to the object at the given library-relative path, suitable for handing
