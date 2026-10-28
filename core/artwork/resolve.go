@@ -518,7 +518,7 @@ func resolveEmbedded(ctx context.Context, lib libraryView, ffm ffmpeg.FFmpeg, em
 	for _, sf := range []sourceFunc{fromTag(ctx, lib.FS, embedRel), fromFFmpegTag(ctx, ffm, lib.ffmpegInput(ctx, embedRel))} {
 		r, _, err := sf()
 		if r != nil {
-			return resolution{reader: r, source: "embedded", sourcePath: abs, refMtime: mtimeViaFS(lib.FS, embedRel)}, true
+			return lib.withBacking(resolution{reader: r, source: "embedded", sourcePath: abs, refMtime: mtimeViaFS(lib.FS, embedRel)}), true
 		}
 		unreadable = unreadable || errors.Is(err, errSourceUnreadable)
 	}
@@ -532,7 +532,7 @@ func resolveFolderSource(lib libraryView, sf sourceFunc) (resolution, bool) {
 	if r == nil {
 		return resolution{localError: errors.Is(err, errSourceUnreadable)}, false
 	}
-	return resolution{reader: r, source: "folder", sourcePath: lib.Abs(path), refMtime: mtimeViaFS(lib.FS, path)}, true
+	return lib.withBacking(resolution{reader: r, source: "folder", sourcePath: lib.Abs(path), refMtime: mtimeViaFS(lib.FS, path)}), true
 }
 
 func resolveFolderFile(ctx context.Context, lib libraryView, imgFiles []string, pattern string) (resolution, bool) {
@@ -568,7 +568,7 @@ func resolveArtistFolderPattern(ctx context.Context, lib libraryView, artistFold
 	if r == nil {
 		return resolution{localError: errors.Is(err, errSourceUnreadable)}, false
 	}
-	return resolution{reader: r, source: "folder", sourcePath: path, refMtime: mtimeOf(path)}, true
+	return lib.withBacking(resolution{reader: r, source: "folder", sourcePath: path, refMtime: mtimeOf(path)}), true
 }
 
 // resolveLocalFile opens an absolute path directly. A missing path is "no source"; any other

@@ -169,7 +169,7 @@ func (s *service) serveHash(ctx context.Context, artID model.ArtworkID, ia *mode
 		return nil, ErrUnavailable
 	}
 	// Checked here, not in openOriginal: a resize-cache hit never opens the source.
-	if isFileBacked(ia.Source) && !model.IsImageFile(ia.SourcePath) {
+	if isFileBacked(ia.Source) && ia.SourcePath != "" && !model.IsImageFile(ia.SourcePath) {
 		log.Warn(ctx, "Artwork: Stored source is not an image file, re-resolving", "artID", artID, "path", ia.SourcePath)
 		return s.dangling(ctx, artID)
 	}
@@ -193,8 +193,9 @@ func (s *service) serveHash(ctx context.Context, artID model.ArtworkID, ia *mode
 }
 
 // openOriginal enforces the mtime invariant: bytes are never served under a hash they no longer match.
+// A file-backed row with no SourcePath came from a remote (s3://) library; its bytes are in the store.
 func openOriginal(ia *model.ItemArtwork, mime string, store *ImageStore) (io.ReadCloser, error) {
-	if isFileBacked(ia.Source) {
+	if isFileBacked(ia.Source) && ia.SourcePath != "" {
 		f, err := os.Open(ia.SourcePath)
 		if err != nil {
 			return nil, err

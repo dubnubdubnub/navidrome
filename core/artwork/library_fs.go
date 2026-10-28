@@ -46,6 +46,25 @@ func (v libraryView) ffmpegInput(ctx context.Context, rel string) string {
 	return v.Abs(rel)
 }
 
+// isRemote reports whether the library's files have no OS path that could be re-opened
+// later with os.Open/os.Stat. That is a backend reached over HTTP, i.e. one implementing
+// storage.URLProvider (s3://), the same test ffmpegInput uses to hand ffmpeg a URL.
+func (v libraryView) isRemote() bool {
+	_, ok := v.FS.(storage.URLProvider)
+	return ok
+}
+
+// withBacking keeps a resolution's sourcePath/refMtime only for a local library. For a
+// remote one it clears both, so placeBytes copies the bytes into the image store and
+// openOriginal serves them from there, instead of os.Open-ing a path that does not exist
+// on disk (filepath.Join even mangles "s3://bucket" into "s3:/bucket").
+func (v libraryView) withBacking(res resolution) resolution {
+	if v.isRemote() {
+		res.sourcePath, res.refMtime = "", 0
+	}
+	return res
+}
+
 // loadLibraryView resolves the MusicFS and absolute root path in a single
 // library lookup.
 func loadLibraryView(ctx context.Context, ds model.DataStore, libID int) (libraryView, error) {
