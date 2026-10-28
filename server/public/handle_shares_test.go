@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 
+	"github.com/go-chi/jwtauth/v5"
 	"github.com/navidrome/navidrome/core"
+	"github.com/navidrome/navidrome/core/auth"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/tests"
 	. "github.com/onsi/ginkgo/v2"
@@ -21,6 +23,11 @@ var _ = Describe("handleM3U", func() {
 		shareRepo = &tests.MockShareRepo{}
 		ds.MockedShare = shareRepo
 		pub = &Router{ds: ds, share: core.NewShare(ds)}
+		// handleM3U signs a public stream token per track. Set the signer here instead of
+		// relying on another spec in the package having set it first, which -shuffle breaks.
+		prev := auth.PublicTokenAuth
+		auth.PublicTokenAuth = jwtauth.New("HS256", []byte("test-secret"), nil)
+		DeferCleanup(func() { auth.PublicTokenAuth = prev })
 	})
 
 	makeRequest := func(id string) *httptest.ResponseRecorder {
