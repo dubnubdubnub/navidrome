@@ -318,12 +318,14 @@ func openMediaFile(mf *model.MediaFile) (io.ReadCloser, error) {
 }
 
 // Presigned URLs are bearer credentials, so each use asks for the shortest expiry that
-// covers its read. A transcode is the long one: with the transcoding cache disabled (or a
-// cache miss streamed live) ffmpeg's reads are paced by the client's playback, and ffmpeg
-// re-requests the URL when it reconnects or seeks, so the URL has to outlast the longest
-// track. A probe reads the container header once.
+// covers its read. S3 checks the signature when a request starts, not while its body is
+// streaming, so a URL only has to be valid for every request ffmpeg makes. No transcode
+// command sets -reconnect, so ffmpeg opens the object once and only issues a new (ranged)
+// request when the demuxer seeks: during probing at the start (e.g. an MP4 whose moov atom
+// is at the end), well inside the hour even when a cache miss is paced by live playback.
+// A probe reads the container header once.
 const (
-	transcodePresignExpiry = 6 * time.Hour
+	transcodePresignExpiry = time.Hour
 	probePresignExpiry     = 5 * time.Minute
 )
 
