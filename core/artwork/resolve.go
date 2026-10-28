@@ -31,6 +31,9 @@ type resolution struct {
 	// a local source that should have been readable wasn't. With no reader it forces failed,
 	// so a transient I/O fault never records absent.
 	localError bool
+	// the hit came from a remote (s3://) library: sourcePath/refMtime were cleared on purpose
+	// (libraryView.withBacking), and only then may a file-backed hit lack a sourcePath.
+	remote bool
 }
 
 // chainState carries what a priority walk has seen so far. A hit takes extErr with it so a

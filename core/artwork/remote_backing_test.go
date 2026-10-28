@@ -30,6 +30,7 @@ var _ = Describe("remote library backing", func() {
 			Expect(res.source).To(Equal(source))
 			Expect(res.sourcePath).To(BeEmpty())
 			Expect(res.refMtime).To(BeZero())
+			Expect(res.remote).To(BeTrue())
 		}
 	})
 
@@ -40,7 +41,7 @@ var _ = Describe("remote library backing", func() {
 		Expect(err).ToNot(HaveOccurred())
 		art := &model.Artwork{Hash: hash, Mime: "image/jpeg"}
 
-		sourcePath, refMtime, err := placeBytes(store, art, resolution{source: "folder"}, data)
+		sourcePath, refMtime, err := placeBytes(store, art, resolution{source: "folder", remote: true}, data)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(sourcePath).To(BeEmpty())
 		Expect(refMtime).To(BeZero())
@@ -51,6 +52,20 @@ var _ = Describe("remote library backing", func() {
 		got, err := io.ReadAll(r)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(got).To(Equal(data))
+	})
+
+	It("refuses a local file-backed hit with no sourcePath instead of storing it", func() {
+		store := NewImageStore(GinkgoT().TempDir())
+		data := []byte("x")
+		hash, err := hashImage(bytes.NewReader(data))
+		Expect(err).ToNot(HaveOccurred())
+		art := &model.Artwork{Hash: hash, Mime: "image/jpeg"}
+		for _, source := range []string{"folder", "upload"} {
+			_, _, err := placeBytes(store, art, resolution{source: source}, data)
+			Expect(err).To(MatchError(errFileBackedNoPath))
+		}
+		_, err = store.Open(hash, art.Mime)
+		Expect(err).To(HaveOccurred(), "nothing may be written to the store")
 	})
 
 	It("still leaves a local folder hit's bytes in the library file", func() {
