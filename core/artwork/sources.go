@@ -122,12 +122,12 @@ func findBestImageIndex(ctx context.Context, images []taglib.ImageDesc, path str
 // other URLProvider backends); see libraryView.ffmpegInput. An empty path means no input
 // is available (e.g. a remote backend that failed to presign), and this source func
 // returns (nil, "", nil) so callers fall through to the next source cleanly.
-func fromFFmpegTag(ctx context.Context, ffmpeg ffmpeg.FFmpeg, path string) sourceFunc {
+func fromFFmpegTag(ctx context.Context, ff ffmpeg.FFmpeg, path string) sourceFunc {
 	return func() (io.ReadCloser, string, error) {
 		if path == "" {
 			return nil, "", nil
 		}
-		r, err := ffmpeg.ExtractImage(ctx, path)
+		r, err := ff.ExtractImage(ctx, path)
 		if err != nil {
 			return nil, "", err
 		}
@@ -138,7 +138,7 @@ func fromFFmpegTag(ctx context.Context, ffmpeg ffmpeg.FFmpeg, path string) sourc
 		n, err := r.Read(buf)
 		if n == 0 || err != nil {
 			r.Close()
-			return nil, "", fmt.Errorf("ffmpeg produced no image data for %s: %w", path, err)
+			return nil, "", fmt.Errorf("ffmpeg produced no image data for %s: %w", ffmpeg.Redact(path), err)
 		}
 		return readCloser{Reader: io.MultiReader(bytes.NewReader(buf[:n]), r), Closer: r}, path, nil
 	}

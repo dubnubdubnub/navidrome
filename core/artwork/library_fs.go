@@ -60,7 +60,7 @@ func (v libraryView) isRemote() bool {
 // on disk (filepath.Join even mangles "s3://bucket" into "s3:/bucket").
 func (v libraryView) withBacking(res resolution) resolution {
 	if v.isRemote() {
-		res.sourcePath, res.refMtime = "", 0
+		res.sourcePath, res.refMtime, res.remote = "", 0, true
 	}
 	return res
 }

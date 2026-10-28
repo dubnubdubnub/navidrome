@@ -328,12 +328,25 @@ func isLocalSource(source string) bool {
 	return isFileBacked(source) || source == "embedded"
 }
 
+// errFileBackedNoPath is a file-backed hit from a local library that lost its sourcePath.
+var errFileBackedNoPath = errors.New("artwork: file-backed resolution from a local library has no source path")
+
 // placeBytes reports the item's backing-file provenance and writes the bytes into the store
 // for the sources that have none. A file-backed hit with no sourcePath (a remote, s3://
 // library; see libraryView.withBacking) has no file to re-open, so it is stored too.
+//
+// That exception is the only way a file-backed row is written with an empty SourcePath, and
+// openOriginal/Get rely on it ("file-backed, no SourcePath => bytes are in the store"). So it
+// is allowed only for res.remote: a local hit without a path is a bug, and is refused loudly
+// rather than silently turned into a store copy that would never notice the file changing.
 func placeBytes(store *ImageStore, art *model.Artwork, res resolution, data []byte) (sourcePath string, refMtime int64, err error) {
-	if isFileBacked(res.source) && res.sourcePath != "" {
-		return res.sourcePath, res.refMtime, nil
+	if isFileBacked(res.source) {
+		switch {
+		case res.sourcePath != "":
+			return res.sourcePath, res.refMtime, nil
+		case !res.remote:
+			return "", 0, fmt.Errorf("%w (source %q)", errFileBackedNoPath, res.source)
+		}
 	}
 	if res.source == "embedded" {
 		sourcePath, refMtime = res.sourcePath, res.refMtime
