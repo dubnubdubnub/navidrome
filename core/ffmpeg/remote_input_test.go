@@ -131,7 +131,26 @@ var _ = Describe("remote (presigned) inputs", func() {
 			}
 			Expect(err).To(HaveOccurred())
 			Expect(nested.Load()).To(BeZero(), "ffmpeg followed a URL from inside the object")
+			// Refused by the format whitelist itself, not by some other parse failure.
+			Expect(err.Error()).To(ContainSubstring("not on whitelist"))
 			Expect(err.Error()).ToNot(ContainSubstring("s3cr3t"))
+		})
+
+		// Informational, not an assertion: records whether this ffmpeg build would follow the
+		// playlist WITHOUT the guard, so the CI log shows the guard is load-bearing on the
+		// version prod ships (Debian bookworm's), not just on a developer's.
+		It("reports whether this ffmpeg is exploitable without the guard", func() {
+			cmdPath, err := ffmpegCmd()
+			Expect(err).ToNot(HaveOccurred())
+			out, _ := exec.CommandContext(GinkgoT().Context(), cmdPath, "-v", "error", // #nosec
+				"-i", srv.URL+"/bucket/evil.m3u8?X-Amz-Signature=s3cr3t", "-f", "null", "-").CombinedOutput()
+			verdict := "NOT exploitable unguarded (refused the playlist on its own)"
+			if nested.Load() > 0 {
+				verdict = "EXPLOITABLE unguarded (followed the URL inside the playlist)"
+			}
+			ver, _ := exec.CommandContext(GinkgoT().Context(), cmdPath, "-version").Output() // #nosec
+			AddReportEntry("unguarded-ssrf", strings.SplitN(string(ver), "\n", 2)[0]+": "+verdict+
+				"; stderr: "+RedactURLs(strings.TrimSpace(string(out))))
 		})
 
 		It("still transcodes a real audio object over HTTP", func() {
@@ -155,6 +174,7 @@ var _ = Describe("remote (presigned) inputs", func() {
 			Expect(err).To(HaveOccurred())
 			var pe *ProbeError
 			Expect(errors.As(err, &pe)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("not on whitelist"))
 			Expect(err.Error()).ToNot(ContainSubstring("s3cr3t"))
 			Expect(nested.Load()).To(BeZero())
 		})
