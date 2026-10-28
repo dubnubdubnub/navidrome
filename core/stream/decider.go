@@ -432,7 +432,7 @@ func probeInput(ctx context.Context, mf *model.MediaFile) (string, error) {
 	if !strings.Contains(mf.LibraryPath, "://") {
 		return mf.AbsolutePath(), nil
 	}
-	u, err := presignedInputURL(ctx, mf)
+	u, err := presignedInputURL(ctx, mf, probePresignExpiry)
 	if err != nil || u == "" {
 		return mf.AbsolutePath(), err
 	}
