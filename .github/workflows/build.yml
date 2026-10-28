@@ -14,6 +14,29 @@ env:
   IMAGE: ghcr.io/dubnubdubnub/navidrome-s3
 
 jobs:
+  # Upstream's pipeline.yml only runs on master, so without this job nothing tests a PR into
+  # the deploy branch. Mirrors upstream's "Test Go code" job (plugins excluded: they need the
+  # WASM test fixtures upstream builds in a separate job). Not a dependency of `build`, so a
+  # deploy is never blocked by it; it is the green/red signal on PRs.
+  test:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Download dependencies
+        run: go mod download
+      - name: Vet
+        run: go vet -tags netgo,sqlite_fts5 $(go list ./... | grep -v '/plugins')
+      - name: Test
+        run: go test -shuffle=on -tags netgo,sqlite_fts5 -race $(go list ./... | grep -v '/plugins$')
+
   build:
     runs-on: ubuntu-latest
     permissions:
