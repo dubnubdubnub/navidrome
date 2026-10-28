@@ -95,7 +95,7 @@ var _ = Describe("remote (presigned) inputs", func() {
 			ffOnce = sync.Once{}
 			ff = New()
 			if !ff.IsAvailable() {
-				Skip("FFmpeg not available on this system")
+				skipUnlessFFmpegRequired()
 			}
 			var err error
 			mp3Data, err = os.ReadFile("tests/fixtures/test.mp3")
@@ -160,3 +160,14 @@ var _ = Describe("remote (presigned) inputs", func() {
 		})
 	})
 })
+
+// skipUnlessFFmpegRequired skips a real-ffmpeg spec on a machine without ffmpeg, except in
+// the CI job that exists to run them (ND_TEST_REQUIRE_FFMPEG=1), where a missing binary must
+// fail loudly rather than turn the SSRF guard specs into silent skips.
+func skipUnlessFFmpegRequired() {
+	GinkgoHelper()
+	if os.Getenv("ND_TEST_REQUIRE_FFMPEG") != "" {
+		Fail("ND_TEST_REQUIRE_FFMPEG is set but ffmpeg is not available")
+	}
+	Skip("FFmpeg not available on this system")
+}

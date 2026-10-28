@@ -10,6 +10,9 @@ on:
 
 env:
   IMAGE: ghcr.io/dubnubdubnub/navidrome-s3
+  # Every job tests/builds the PR head itself (not GitHub's synthetic merge commit), so what
+  # was tested is exactly what the image tag names.
+  SRC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   test:
@@ -19,6 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.SRC_SHA }}
           persist-credentials: false
 
       - uses: actions/setup-go@v6
@@ -42,8 +46,35 @@ jobs:
           npm ci
           npm test
 
+  # The runner image has no ffmpeg, so in `test` every real-ffmpeg spec (including the
+  # remote-input SSRF guard) is skipped. Prod runs Debian bookworm's ffmpeg (Dockerfile.s3's
+  # runtime is debian:bookworm-slim + apt ffmpeg), so run the ffmpeg suite against exactly
+  # that package. ND_TEST_REQUIRE_FFMPEG turns a missing binary into a failure, not a skip.
+  ffmpeg-bookworm:
+    runs-on: ubuntu-latest
+    container: golang:1.27.3-bookworm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SRC_SHA }}
+          persist-credentials: false
+
+      - name: Install bookworm ffmpeg (the package prod's image ships)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          dpkg-query -W ffmpeg
+
+      - name: ffmpeg suite against bookworm ffmpeg
+        env:
+          ND_TEST_REQUIRE_FFMPEG: "1"
+        run: go test -count=1 -tags netgo,sqlite_fts5 ./core/ffmpeg/ -ginkgo.v
+
   build:
-    needs: test
+    needs: [test, ffmpeg-bookworm]
     runs-on: ubuntu-latest
     permissions:
       contents: write # to commit the deploy/ tag write-back (push to feat/s3-streaming only)
@@ -52,7 +83,6 @@ jobs:
       # Only a build of feat/s3-streaming itself gets the bare-SHA tag that deploy/ pins. A PR
       # (or a dispatch on another branch) builds unreviewed code, so its image is published as
       # `test-<sha>` and can never be mistaken for, or collide with, a deployable tag.
-      SRC_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       DEPLOYABLE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/feat/s3-streaming' }}
       # Push only from this repo: a PR from a fork gets a read-only token.
       PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -102,4 +132,8 @@ jobs:
           git config user.email "ci@dubnubdubnub"
           git add deploy/kustomization.yaml
           git commit -m "ci: deploy ${{ github.sha }} [skip ci]" || { echo "no deploy change"; exit 0; }
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" HEAD:refs/heads/feat/s3-streaming
+          # Token as a one-shot auth header (never in the remote URL, .git/config or argv of a
+          # long-lived process), masked in case anything echoes it.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::${AUTH}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${AUTH}" push origin HEAD:refs/heads/feat/s3-streaming

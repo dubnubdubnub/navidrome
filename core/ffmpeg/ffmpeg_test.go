@@ -677,7 +677,7 @@ var _ = Describe("ffmpeg", func() {
 				ff = New()
 				// Skip if FFmpeg is not available
 				if !ff.IsAvailable() {
-					Skip("FFmpeg not available on this system")
+					skipUnlessFFmpegRequired()
 				}
 			})
 
