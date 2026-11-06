@@ -499,6 +499,31 @@ var _ = Describe("Scanner", Ordered, func() {
 		})
 	})
 
+	Context("Library with a configured album version", func() {
+		BeforeEach(func() {
+			conf.Server.Scanner.LibraryAlbumVersions = "s3://other=Nope; fake:///music=24-bit"
+			revolver := template(_t{"albumartist": "The Beatles", "album": "Revolver", "year": 1966})
+			createFS(fstest.MapFS{
+				"The Beatles/Revolver/01 - Taxman.mp3": revolver(track(1, "Taxman")),
+			})
+		})
+
+		It("stamps the version on every track and album of that library", func() {
+			Expect(runScanner(ctx, true)).To(Succeed())
+
+			albums, err := ds.Album(ctx).GetAll()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(albums).To(HaveLen(1))
+			Expect(albums[0].Name).To(Equal("Revolver"))
+			Expect(albums[0].FullName()).To(Equal("Revolver (24-bit)"))
+
+			mfs, err := ds.MediaFile(ctx).GetAll()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mfs).To(HaveLen(1))
+			Expect(mfs[0].Tags.Values(model.TagAlbumVersion)).To(Equal([]string{"24-bit"}))
+		})
+	})
+
 	Context("Same album, different release dates", func() {
 		BeforeEach(func() {
 			help := template(_t{"albumartist": "The Beatles", "album": "Help!", "releasedate": 1965})
