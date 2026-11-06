@@ -3,6 +3,7 @@ package metadata
 import (
 	"cmp"
 	"io/fs"
+	"maps"
 	"math"
 	"path"
 	"regexp"
@@ -83,6 +84,23 @@ type Metadata struct {
 	tags       model.Tags
 	audioProps AudioProperties
 	hasPicture bool
+}
+
+// WithAlbumVersion returns a copy of md whose album version includes version: set when the
+// file has none, appended ("Deluxe, 24-bit") when it has one that doesn't already say so.
+func (md Metadata) WithAlbumVersion(version string) Metadata {
+	if version == "" {
+		return md
+	}
+	md.tags = maps.Clone(md.tags)
+	existing := md.tags[model.TagAlbumVersion]
+	switch {
+	case len(existing) == 0:
+		md.tags[model.TagAlbumVersion] = []string{version}
+	case !strings.Contains(existing[0], version):
+		md.tags[model.TagAlbumVersion] = append([]string{existing[0] + ", " + version}, existing[1:]...)
+	}
+	return md
 }
 
 func (md Metadata) FilePath() string     { return md.filePath }

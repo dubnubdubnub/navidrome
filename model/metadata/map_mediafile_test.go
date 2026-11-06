@@ -33,6 +33,46 @@ var _ = Describe("ToMediaFile", func() {
 		return md.ToMediaFile(1, "folderID")
 	}
 
+	Describe("WithAlbumVersion", func() {
+		var mapWithVersion = func(tags model.RawTags, version string) model.MediaFile {
+			props.Tags = tags
+			return metadata.New("filepath", props).WithAlbumVersion(version).ToMediaFile(1, "folderID")
+		}
+
+		It("sets the album version when the file has none", func() {
+			mf = mapWithVersion(model.RawTags{"ALBUM": {"Bittersweet"}}, "24-bit")
+			Expect(mf.Tags.Values(model.TagAlbumVersion)).To(Equal([]string{"24-bit"}))
+			Expect(mf.FullAlbumName()).To(Equal("Bittersweet (24-bit)"))
+		})
+
+		It("appends to an existing album version", func() {
+			mf = mapWithVersion(model.RawTags{"ALBUM": {"Constant Companions"}, "ALBUMVERSION": {"Deluxe Edition"}}, "24-bit")
+			Expect(mf.Tags.Values(model.TagAlbumVersion)).To(Equal([]string{"Deluxe Edition, 24-bit"}))
+		})
+
+		It("does not repeat a version the file already carries", func() {
+			mf = mapWithVersion(model.RawTags{"ALBUM": {"X"}, "ALBUMVERSION": {"24-bit Remaster"}}, "24-bit")
+			Expect(mf.Tags.Values(model.TagAlbumVersion)).To(Equal([]string{"24-bit Remaster"}))
+		})
+
+		It("is a no-op for an empty version", func() {
+			mf = mapWithVersion(model.RawTags{"ALBUM": {"X"}}, "")
+			Expect(mf.Tags.Values(model.TagAlbumVersion)).To(BeEmpty())
+		})
+
+		It("gives the album a different ID than the untagged copy", func() {
+			tags := model.RawTags{"ALBUM": {"X"}, "ALBUMARTIST": {"A"}}
+			Expect(mapWithVersion(tags, "24-bit").AlbumID).ToNot(Equal(mapWithVersion(tags, "").AlbumID))
+		})
+
+		It("does not modify the original metadata", func() {
+			props.Tags = model.RawTags{"ALBUM": {"X"}}
+			md = metadata.New("filepath", props)
+			_ = md.WithAlbumVersion("24-bit")
+			Expect(md.All()[model.TagAlbumVersion]).To(BeEmpty())
+		})
+	})
+
 	Describe("Dates", func() {
 		It("should parse properly tagged dates ", func() {
 			mf = toMediaFile(model.RawTags{

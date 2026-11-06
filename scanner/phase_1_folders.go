@@ -281,6 +281,9 @@ const filesBatchSize = 200
 func (p *phaseFolders) loadTagsFromFiles(entry *folderEntry, toImport map[string]*model.MediaFile) error {
 	tracks := make([]model.MediaFile, 0, len(toImport))
 	uniqueTags := make(map[string]model.Tag, len(toImport))
+	// Validated at startup (conf.validateLibraryAlbumVersions), so the error cannot occur here.
+	albumVersions, _ := conf.ParseLibraryAlbumVersions(conf.Server.Scanner.LibraryAlbumVersions)
+	albumVersion := albumVersions[entry.job.lib.Path]
 	for chunk := range slice.CollectChunks(maps.Keys(toImport), filesBatchSize) {
 		allInfo, err := entry.job.fs.ReadTags(chunk...)
 		if err != nil {
@@ -288,7 +291,7 @@ func (p *phaseFolders) loadTagsFromFiles(entry *folderEntry, toImport map[string
 			return err
 		}
 		for filePath, info := range allInfo {
-			md := metadata.New(filePath, info)
+			md := metadata.New(filePath, info).WithAlbumVersion(albumVersion)
 			track := md.ToMediaFile(entry.job.lib.ID, entry.id)
 			tracks = append(tracks, track)
 			for _, t := range track.Tags.FlattenAll() {

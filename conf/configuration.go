@@ -177,6 +177,10 @@ type scannerOptions struct {
 	FollowSymlinks        bool     // Whether to follow symlinks when scanning directories
 	IgnoreDotFolders      bool     // Whether to ignore folders whose name starts with a dot when scanning
 	PurgeMissing          string   // Values: "never", "always", "full"
+	// LibraryAlbumVersions stamps an album version on every track of a library, as
+	// "<library path>=<version>" pairs separated by ";" (e.g. "s3://music-24bit-originals=24-bit").
+	// The version shows up wherever an ALBUMVERSION tag would, e.g. "Album (24-bit)" in Subsonic.
+	LibraryAlbumVersions string
 }
 
 // s3Options configures the native s3:// storage backend (e.g. against Garage or AWS S3).
@@ -466,6 +470,7 @@ func Load(noConfigDump bool) {
 		validateBackupSchedule,
 		validatePlaylistsPath,
 		validatePurgeMissingOption,
+		validateLibraryAlbumVersions,
 		validateByteSize("MaxImageUploadSize", Server.MaxImageUploadSize),
 		validateByteSize("MaxImageSize", Server.MaxImageSize),
 		validateURL("ExtAuth.LogoutURL", Server.ExtAuth.LogoutURL),
@@ -849,6 +854,32 @@ func parseLanguages(lang string) []string {
 	return languages
 }
 
+func validateLibraryAlbumVersions() error {
+	_, err := ParseLibraryAlbumVersions(Server.Scanner.LibraryAlbumVersions)
+	return err
+}
+
+// ParseLibraryAlbumVersions parses Scanner.LibraryAlbumVersions into a library path -> version map.
+func ParseLibraryAlbumVersions(value string) (map[string]string, error) {
+	versions := map[string]string{}
+	for entry := range strings.SplitSeq(value, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		path, version, ok := strings.Cut(entry, "=")
+		path, version = strings.TrimSpace(path), strings.TrimSpace(version)
+		if !ok || path == "" || version == "" {
+			return nil, fmt.Errorf("invalid Scanner.LibraryAlbumVersions entry %q: expected <library path>=<version>", entry)
+		}
+		if _, dup := versions[path]; dup {
+			return nil, fmt.Errorf("invalid Scanner.LibraryAlbumVersions: library path %q listed twice", path)
+		}
+		versions[path] = version
+	}
+	return versions, nil
+}
+
 func validatePurgeMissingOption() error {
 	allowedValues := []string{consts.PurgeMissingNever, consts.PurgeMissingAlways, consts.PurgeMissingFull}
 	valid := slices.Contains(allowedValues, Server.Scanner.PurgeMissing)
@@ -1078,6 +1109,7 @@ func setViperDefaults() {
 	viper.SetDefault("scanner.followsymlinks", true)
 	viper.SetDefault("scanner.ignoredotfolders", true)
 	viper.SetDefault("scanner.purgemissing", consts.PurgeMissingNever)
+	viper.SetDefault("scanner.libraryalbumversions", "")
 	viper.SetDefault("s3.endpoint", "")
 	viper.SetDefault("s3.region", "")
 	viper.SetDefault("s3.accesskey", "")

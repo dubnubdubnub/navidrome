@@ -92,3 +92,8 @@ data:
   # A configmap change alone does not restart this pod; see the revision annotation in
   # deployment.yaml.
   ND_SCANNER_SCHEDULE: 0 4 * * *
+  # Label the Hi-Res library's albums "Album (24-bit)" (Subsonic name + OpenSubsonic `version`)
+  # without touching the archived originals: the scanner stamps ALBUMVERSION=24-bit on every
+  # track of that library. Key = the library's path exactly as stored in Navidrome. A changed
+  # value only reaches files the scanner re-reads, so run a full scan after editing it.
+  ND_SCANNER_LIBRARYALBUMVERSIONS: s3://music-24bit-originals=24-bit

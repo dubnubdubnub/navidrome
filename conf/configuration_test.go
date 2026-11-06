@@ -38,6 +38,36 @@ var _ = Describe("Configuration", func() {
 		}))
 	})
 
+	Describe("ParseLibraryAlbumVersions", func() {
+		It("returns an empty map for an empty value", func() {
+			Expect(conf.ParseLibraryAlbumVersions("")).To(BeEmpty())
+		})
+
+		It("parses ';'-separated path=version pairs, keeping the URI scheme intact", func() {
+			Expect(conf.ParseLibraryAlbumVersions(" s3://music-24bit-originals = 24-bit ; /music/vinyl=Vinyl Rip; ")).To(Equal(map[string]string{
+				"s3://music-24bit-originals": "24-bit",
+				"/music/vinyl":               "Vinyl Rip",
+			}))
+		})
+
+		It("rejects an entry without a version", func() {
+			_, err := conf.ParseLibraryAlbumVersions("s3://music")
+			Expect(err).To(MatchError(ContainSubstring(`"s3://music"`)))
+		})
+
+		It("rejects an entry with an empty path or version", func() {
+			_, err := conf.ParseLibraryAlbumVersions("=24-bit")
+			Expect(err).To(HaveOccurred())
+			_, err = conf.ParseLibraryAlbumVersions("s3://music=")
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("rejects a library path listed twice", func() {
+			_, err := conf.ParseLibraryAlbumVersions("s3://a=24-bit;s3://a=Hi-Res")
+			Expect(err).To(MatchError(ContainSubstring("listed twice")))
+		})
+	})
+
 	Describe("ParseLanguages", func() {
 		It("parses single language", func() {
 			Expect(conf.ParseLanguages("en")).To(Equal([]string{"en"}))
