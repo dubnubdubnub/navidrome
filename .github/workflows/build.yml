@@ -10,6 +10,10 @@ on:
 
 env:
   IMAGE: ghcr.io/dubnubdubnub/navidrome-s3
+  # docker/build-push-action v6 uploads a `.dockerbuild` build-record artifact per build
+  # by default (90-day retention), which counts against the account's GitHub artifact
+  # storage quota (hit 2026-11-21; it blocked infra's deploys). Off: the build summary stays.
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   test:
