@@ -33,7 +33,8 @@ spec:
         # at every boot and the library only ever scanned on startup.
         # 3 = ND_ENABLEINSIGHTSCOLLECTOR=false (2026-10-28).
         # 4 = ND_SCANNER_LIBRARYALBUMVERSIONS for the Hi-Res library (2026-11-05).
-        config.navidrome.dubnubdubnub.com/revision: "4"
+        # 5 = ND_CLIENTIPHEADER_TRUSTEDPROXIES, per-client login limiting (PR #18, 2026-11-25).
+        config.navidrome.dubnubdubnub.com/revision: "5"
     spec:
       imagePullSecrets:
         - { name: ghcr-pull }

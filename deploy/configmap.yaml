@@ -9,6 +9,24 @@ data:
   # navidrome egress NetworkPolicy (infra gitops/music-netpol) would not stop it,
   # because it allows public :443 for the metadata agents.
   ND_ENABLEINSIGHTSCOLLECTOR: "false"
+  # Per-client login limiting behind the tunnel (PR #18, ClientIPHeader). Without it every
+  # internet client reaches Navidrome from a cloudflared pod and shares ONE Subsonic
+  # failed-login bucket per username (anyone could lock anyone out), and auth-failure logs show
+  # the pod, not the client. With it, a request whose TCP peer is in this CIDR and carries exactly
+  # one valid CF-Connecting-IP uses that IP as the client IP (limiter key + logged remoteAddr).
+  # It does NOT enable header login and reads no other forwarding header; do not use
+  # ND_EXTAUTH_TRUSTEDSOURCES for this (that turns on Remote-User login).
+  #
+  # 10.42.0.0/16 = the k3s pod CIDR. What that trusts is whatever the music NetworkPolicies
+  # (infra gitops/music-netpol/music-allow-ingress.yaml) admit to navidrome:4533: cloudflared,
+  # the Tailscale Serve proxy of Ingress music/navidrome, music-web, music-ingest +
+  # lyrics-backfill, checks-music, checks-amperfy, and kubelet probes. Internet clients cannot
+  # set the header: Cloudflare sets CF-Connecting-IP itself on edge-to-origin traffic. Tailnet
+  # clients CAN (the Serve proxy passes their headers through), so a tailnet device could pick
+  # its own limiter bucket or logged IP. music-web forwards only Range and music-ingest builds
+  # its own requests (checked in PR #18). Re-check this if a new source is admitted to navidrome.
+  # ND_CLIENTIPHEADER_NAME is left at its default, CF-Connecting-IP.
+  ND_CLIENTIPHEADER_TRUSTEDPROXIES: "10.42.0.0/16"
   ND_IMAGECACHESIZE: 500MB
   ND_LOGLEVEL: info
   ND_MUSICFOLDER: s3://music
