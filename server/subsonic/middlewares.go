@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -218,7 +217,7 @@ func getPlayer(players core.Players) func(next http.Handler) http.Handler {
 			userName, _ := request.UsernameFrom(ctx)
 			client, _ := request.ClientFrom(ctx)
 			playerId := playerIDFromCookie(r, userName)
-			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			ip := middleware.GetClientIP(r.Context())
 			userAgent := canonicalUserAgent(r)
 			player, trc, err := players.Register(ctx, playerId, client, userAgent, ip)
 			if err != nil {
