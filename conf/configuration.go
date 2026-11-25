@@ -4,8 +4,10 @@ import (
 	"cmp"
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -112,6 +114,7 @@ type configOptions struct {
 	AuthWindowLength                time.Duration
 	PasswordEncryptionKey           string
 	ExtAuth                         extAuthOptions
+	ClientIPHeader                  clientIPHeaderOptions
 	Plugins                         pluginsOptions
 	HTTPHeaders                     httpHeaderOptions   `json:",omitzero"`
 	Prometheus                      prometheusOptions   `json:",omitzero"`
@@ -311,6 +314,14 @@ type extAuthOptions struct {
 	LogoutURL      string
 }
 
+// clientIPHeaderOptions takes the client IP from one header set by a proxy in front of Navidrome
+// (Cloudflare's CF-Connecting-IP by default), for peers in TrustedProxies only. Unlike
+// ExtAuth.TrustedSources it does not enable header login and reads no other forwarding header.
+type clientIPHeaderOptions struct {
+	Name           string
+	TrustedProxies string
+}
+
 type searchOptions struct {
 	Backend    string
 	FullString bool
@@ -471,6 +482,7 @@ func Load(noConfigDump bool) {
 		validatePlaylistsPath,
 		validatePurgeMissingOption,
 		validateLibraryAlbumVersions,
+		validateClientIPHeader,
 		validateByteSize("MaxImageUploadSize", Server.MaxImageUploadSize),
 		validateByteSize("MaxImageSize", Server.MaxImageSize),
 		validateURL("ExtAuth.LogoutURL", Server.ExtAuth.LogoutURL),
@@ -880,6 +892,34 @@ func ParseLibraryAlbumVersions(value string) (map[string]string, error) {
 	return versions, nil
 }
 
+func validateClientIPHeader() error {
+	proxies, err := ParseTrustedProxies(Server.ClientIPHeader.TrustedProxies)
+	if err != nil {
+		return err
+	}
+	if len(proxies) > 0 && strings.TrimSpace(Server.ClientIPHeader.Name) == "" {
+		return errors.New("invalid ClientIPHeader: Name must be set when TrustedProxies is set")
+	}
+	return nil
+}
+
+// ParseTrustedProxies parses ClientIPHeader.TrustedProxies, a comma-separated list of CIDRs.
+func ParseTrustedProxies(value string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for entry := range strings.SplitSeq(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ClientIPHeader.TrustedProxies entry %q: expected a CIDR such as 10.42.0.0/16", entry)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
+}
+
 func validatePurgeMissingOption() error {
 	allowedValues := []string{consts.PurgeMissingNever, consts.PurgeMissingAlways, consts.PurgeMissingFull}
 	valid := slices.Contains(allowedValues, Server.Scanner.PurgeMissing)
@@ -1090,6 +1130,8 @@ func setViperDefaults() {
 	viper.SetDefault("extauth.userheader", "Remote-User")
 	viper.SetDefault("extauth.trustedsources", "")
 	viper.SetDefault("extauth.logouturl", "")
+	viper.SetDefault("clientipheader.name", "CF-Connecting-IP")
+	viper.SetDefault("clientipheader.trustedproxies", "")
 	viper.SetDefault("prometheus.enabled", false)
 	viper.SetDefault("prometheus.metricspath", consts.PrometheusDefaultPath)
 	viper.SetDefault("prometheus.password", "")

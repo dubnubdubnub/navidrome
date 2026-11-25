@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -170,10 +171,38 @@ func clientUniqueIDMiddleware(next http.Handler) http.Handler {
 
 // realIPMiddleware resolves the request's client IP into the context, where it can be read with
 // middleware.GetClientIP, and mirrors it into RemoteAddr for logging and player registration.
-// Forwarding headers are only honoured when the peer is listed in ExtAuth.TrustedSources, so that
+// A client IP header (ClientIPHeader) is only honoured when the peer is in ClientIPHeader.TrustedProxies,
+// and other forwarding headers only when the peer is listed in ExtAuth.TrustedSources, so that
 // a client cannot pick its own identity and evade controls keyed on it. The peer address is kept
 // in the context as request.ReverseProxyIp.
 func realIPMiddleware(next http.Handler) http.Handler {
+	fromForwarding := forwardedIPMiddleware(next)
+	proxies, err := conf.ParseTrustedProxies(conf.Server.ClientIPHeader.TrustedProxies)
+	if err != nil {
+		panic(err) // conf.Load validates it, so this is a programming error
+	}
+	if len(proxies) == 0 {
+		return fromForwarding
+	}
+	header := http.CanonicalHeaderKey(conf.Server.ClientIPHeader.Name)
+	fromHeader := chi.Chain(
+		middleware.ClientIPFromRemoteAddr,
+		middleware.ClientIPFromHeader(header),
+	).Handler(mirrorClientIP(next))
+
+	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if peerInPrefixes(r, proxies) && validClientIPHeader(r, header) {
+			fromHeader.ServeHTTP(w, r)
+			return
+		}
+		fromForwarding.ServeHTTP(w, r)
+	})
+	return reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr })(dispatch)
+}
+
+// forwardedIPMiddleware resolves the client IP from the peer, or from the forwarding headers when the
+// peer is listed in ExtAuth.TrustedSources.
+func forwardedIPMiddleware(next http.Handler) http.Handler {
 	trusted := conf.Server.ExtAuth.TrustedSources
 	fromPeer := middleware.ClientIPFromRemoteAddr(next)
 	if trusted == "" {
@@ -198,6 +227,35 @@ func realIPMiddleware(next http.Handler) http.Handler {
 		fromPeer.ServeHTTP(w, r)
 	})
 	return reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr })(dispatch)
+}
+
+// peerInPrefixes reports whether the TCP peer is inside one of the prefixes. A unix socket peer never is.
+func peerInPrefixes(r *http.Request, prefixes []netip.Prefix) bool {
+	ip, err := netip.ParseAddr(peerHost(r))
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	return slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(ip) })
+}
+
+// validClientIPHeader reports whether the header holds exactly one value, and that value is one IP.
+// Anything else falls back to the peer: the proxy sets this header itself, so a list or a malformed
+// value means something other than that proxy wrote it.
+func validClientIPHeader(r *http.Request, header string) bool {
+	values := r.Header.Values(header)
+	switch {
+	case len(values) == 0:
+		return false
+	case len(values) > 1:
+		log.Debug(r.Context(), "Ignoring client IP header with more than one value", "header", header, "values", values, "peer", r.RemoteAddr)
+		return false
+	}
+	if _, err := netip.ParseAddr(values[0]); err != nil {
+		log.Debug(r.Context(), "Ignoring malformed client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
+		return false
+	}
+	return true
 }
 
 // mirrorClientIP copies the resolved client IP into RemoteAddr when it differs from the peer.

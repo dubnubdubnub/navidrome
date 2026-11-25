@@ -15,11 +15,13 @@ import (
 	"github.com/navidrome/navidrome/conf/configtest"
 	"github.com/navidrome/navidrome/consts"
 	"github.com/navidrome/navidrome/core/publicurl"
+	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
 	"github.com/navidrome/navidrome/tests"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/sirupsen/logrus"
 )
 
 var _ = Describe("middlewares", func() {
@@ -437,21 +439,32 @@ var _ = Describe("middlewares", func() {
 		})
 	})
 	Describe("realIPMiddleware", func() {
-		var resolved, remoteAddr string
+		var resolved, remoteAddr, clientIP, extAuthUser string
 		var proxyIP any
 		next := func(w http.ResponseWriter, r *http.Request) {
 			resolved = middleware.GetClientIP(r.Context())
 			remoteAddr = r.RemoteAddr
 			proxyIP = r.Context().Value(request.ReverseProxyIp)
+			clientIP = ClientIP(r)
+			extAuthUser = UsernameFromExtAuthHeader(r)
 		}
-		call := func(peer string, headers map[string]string) {
-			resolved, remoteAddr, proxyIP = "", "", nil
+		callWith := func(peer string, headers http.Header) {
+			resolved, remoteAddr, clientIP, extAuthUser, proxyIP = "", "", "", "", nil
 			r := httptest.NewRequest("POST", "/auth/login", nil)
 			r.RemoteAddr = peer
-			for k, v := range headers {
-				r.Header.Set(k, v)
+			for k, vs := range headers {
+				for _, v := range vs {
+					r.Header.Add(k, v)
+				}
 			}
 			realIPMiddleware(http.HandlerFunc(next)).ServeHTTP(httptest.NewRecorder(), r)
+		}
+		call := func(peer string, headers map[string]string) {
+			h := http.Header{}
+			for k, v := range headers {
+				h.Set(k, v)
+			}
+			callWith(peer, h)
 		}
 
 		Context("without a trusted proxy", func() {
@@ -492,6 +505,132 @@ var _ = Describe("middlewares", func() {
 				Expect(proxyIP).To(Equal("10.0.0.1:1234"))
 			})
 		})
+
+		Context("with a client IP header", func() {
+			BeforeEach(func() {
+				conf.Server.ClientIPHeader.Name = "CF-Connecting-IP"
+				conf.Server.ClientIPHeader.TrustedProxies = "10.42.0.0/16"
+			})
+
+			It("uses the header IP when the peer is a trusted proxy", func() {
+				call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+				Expect(resolved).To(Equal("203.0.113.5"))
+				Expect(clientIP).To(Equal("203.0.113.5"))
+				Expect(remoteAddr).To(Equal("203.0.113.5"))
+				Expect(proxyIP).To(Equal("10.42.1.5:40000"))
+			})
+
+			It("accepts an IPv6 client and a v4-mapped trusted peer", func() {
+				call("[::ffff:10.42.1.5]:40000", map[string]string{"CF-Connecting-IP": "2001:db8::7"})
+				Expect(resolved).To(Equal("2001:db8::7"))
+				Expect(remoteAddr).To(Equal("2001:db8::7"))
+			})
+
+			It("ignores the header when the peer is not a trusted proxy", func() {
+				call("198.51.100.9:1234", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+				Expect(resolved).To(Equal("198.51.100.9"))
+				Expect(clientIP).To(Equal("198.51.100.9"))
+				Expect(remoteAddr).To(Equal("198.51.100.9:1234"))
+			})
+
+			It("ignores the header from a unix socket peer", func() {
+				call("@", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+				Expect(resolved).To(BeEmpty())
+				Expect(remoteAddr).To(Equal("@"))
+			})
+
+			It("ignores the other forwarding headers from a trusted proxy", func() {
+				spoofs := map[string]string{
+					"X-Forwarded-For": "203.0.113.5",
+					"X-Real-IP":       "203.0.113.6",
+					"True-Client-IP":  "203.0.113.7",
+				}
+				call("10.42.1.5:40000", spoofs)
+				Expect(resolved).To(Equal("10.42.1.5"))
+				Expect(remoteAddr).To(Equal("10.42.1.5:40000"))
+
+				spoofs["CF-Connecting-IP"] = "198.51.100.20"
+				call("10.42.1.5:40000", spoofs)
+				Expect(resolved).To(Equal("198.51.100.20"))
+			})
+
+			It("does not enable header login", func() {
+				call("10.42.1.5:40000", map[string]string{
+					"CF-Connecting-IP": "203.0.113.5",
+					"Remote-User":      "admin",
+				})
+				Expect(extAuthUser).To(BeEmpty())
+			})
+
+			DescribeTable("falls back to the peer when the header is not exactly one IP",
+				func(values ...string) {
+					callWith("10.42.1.5:40000", http.Header{"Cf-Connecting-Ip": values})
+					Expect(resolved).To(Equal("10.42.1.5"))
+					Expect(clientIP).To(Equal("10.42.1.5"))
+					Expect(remoteAddr).To(Equal("10.42.1.5:40000"))
+				},
+				Entry("garbage", "not-an-ip"),
+				Entry("empty", ""),
+				Entry("a list", "203.0.113.5, 198.51.100.1"),
+				Entry("an IP with a port", "203.0.113.5:443"),
+				Entry("a CIDR", "203.0.113.0/24"),
+				Entry("repeated headers", "203.0.113.5", "198.51.100.1"),
+			)
+
+			It("logs a rejected header at debug level", func() {
+				hook, cleanup := tests.LogHook()
+				DeferCleanup(cleanup)
+				log.SetLevel(log.LevelDebug)
+
+				callWith("10.42.1.5:40000", http.Header{"Cf-Connecting-Ip": {"203.0.113.5", "198.51.100.1"}})
+				Expect(hook.LastEntry()).ToNot(BeNil())
+				Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+				Expect(hook.LastEntry().Message).To(ContainSubstring("more than one value"))
+
+				callWith("10.42.1.5:40000", http.Header{"Cf-Connecting-Ip": {"not-an-ip"}})
+				Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+				Expect(hook.LastEntry().Message).To(ContainSubstring("malformed"))
+			})
+
+			It("reads a custom header name", func() {
+				conf.Server.ClientIPHeader.Name = "X-Edge-Client"
+				call("10.42.1.5:40000", map[string]string{
+					"X-Edge-Client":    "203.0.113.5",
+					"CF-Connecting-IP": "198.51.100.1",
+				})
+				Expect(resolved).To(Equal("203.0.113.5"))
+			})
+
+			It("panics on an invalid TrustedProxies, which conf.Load rejects first", func() {
+				conf.Server.ClientIPHeader.TrustedProxies = "10.42.0.0"
+				Expect(func() { realIPMiddleware(http.HandlerFunc(next)) }).To(Panic())
+			})
+
+			Context("when ExtAuth.TrustedSources is also set", func() {
+				BeforeEach(func() {
+					conf.Server.ExtAuth.TrustedSources = "10.0.0.0/8"
+				})
+				It("prefers the header for a peer trusted by both", func() {
+					call("10.42.1.5:40000", map[string]string{
+						"CF-Connecting-IP": "203.0.113.5",
+						"X-Real-IP":        "198.51.100.1",
+					})
+					Expect(resolved).To(Equal("203.0.113.5"))
+					Expect(proxyIP).To(Equal("10.42.1.5:40000"))
+				})
+				It("keeps ExtAuth's forwarding headers without a valid header", func() {
+					call("10.42.1.5:40000", map[string]string{"X-Real-IP": "198.51.100.1"})
+					Expect(resolved).To(Equal("198.51.100.1"))
+				})
+				It("keeps ExtAuth's forwarding headers for a peer only ExtAuth trusts", func() {
+					call("10.1.2.3:40000", map[string]string{
+						"CF-Connecting-IP": "203.0.113.5",
+						"X-Real-IP":        "198.51.100.1",
+					})
+					Expect(resolved).To(Equal("198.51.100.1"))
+				})
+			})
+		})
 	})
 
 	Describe("ClientIPRateLimiter", func() {
@@ -529,6 +668,24 @@ var _ = Describe("middlewares", func() {
 				Expect(attempt("10.0.0.1:2", "X-Forwarded-For", "203.0.113.1")).To(Equal(http.StatusOK))
 				Expect(attempt("10.0.0.1:3", "X-Forwarded-For", "203.0.113.1")).To(Equal(http.StatusTooManyRequests))
 				Expect(attempt("10.0.0.1:4", "X-Forwarded-For", "203.0.113.2")).To(Equal(http.StatusOK))
+			})
+		})
+
+		Context("behind a proxy trusted for the client IP header", func() {
+			BeforeEach(func() {
+				conf.Server.ClientIPHeader.Name = "CF-Connecting-IP"
+				conf.Server.ClientIPHeader.TrustedProxies = "10.42.0.0/16"
+			})
+			It("gives each real client its own bucket", func() {
+				Expect(attempt("10.42.0.7:1", "CF-Connecting-IP", "203.0.113.1")).To(Equal(http.StatusOK))
+				Expect(attempt("10.42.1.8:2", "CF-Connecting-IP", "203.0.113.1")).To(Equal(http.StatusOK))
+				Expect(attempt("10.42.0.7:3", "CF-Connecting-IP", "203.0.113.1")).To(Equal(http.StatusTooManyRequests))
+				Expect(attempt("10.42.0.7:4", "CF-Connecting-IP", "203.0.113.2")).To(Equal(http.StatusOK))
+			})
+			It("keeps one bucket per peer when an untrusted peer rotates the header", func() {
+				Expect(attempt("198.51.100.9:1", "CF-Connecting-IP", "203.0.113.1")).To(Equal(http.StatusOK))
+				Expect(attempt("198.51.100.9:2", "CF-Connecting-IP", "203.0.113.2")).To(Equal(http.StatusOK))
+				Expect(attempt("198.51.100.9:3", "CF-Connecting-IP", "203.0.113.3")).To(Equal(http.StatusTooManyRequests))
 			})
 		})
 	})

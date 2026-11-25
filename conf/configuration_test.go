@@ -3,6 +3,7 @@ package conf_test
 import (
 	"bytes"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -65,6 +66,62 @@ var _ = Describe("Configuration", func() {
 		It("rejects a library path listed twice", func() {
 			_, err := conf.ParseLibraryAlbumVersions("s3://a=24-bit;s3://a=Hi-Res")
 			Expect(err).To(MatchError(ContainSubstring("listed twice")))
+		})
+	})
+
+	Describe("ClientIPHeader", func() {
+		It("is off by default, with Cloudflare's header", func() {
+			conf.Load(true)
+			Expect(conf.Server.ClientIPHeader.TrustedProxies).To(BeEmpty())
+			Expect(conf.Server.ClientIPHeader.Name).To(Equal("CF-Connecting-IP"))
+		})
+
+		It("reads ND_CLIENTIPHEADER_TRUSTEDPROXIES and ND_CLIENTIPHEADER_NAME", func() {
+			GinkgoT().Setenv("ND_CLIENTIPHEADER_TRUSTEDPROXIES", "10.42.0.0/16")
+			GinkgoT().Setenv("ND_CLIENTIPHEADER_NAME", "X-Edge-Client")
+			conf.InitConfig("", true)
+			conf.Load(true)
+			Expect(conf.Server.ClientIPHeader.TrustedProxies).To(Equal("10.42.0.0/16"))
+			Expect(conf.Server.ClientIPHeader.Name).To(Equal("X-Edge-Client"))
+		})
+
+		It("fails startup on an invalid TrustedProxies entry", func() {
+			viper.Set("clientipheader.trustedproxies", "10.42.0.0/16,10.43.0.1")
+			Expect(func() { conf.Load(true) }).To(PanicWith(ContainSubstring(`"10.43.0.1"`)))
+		})
+
+		It("fails startup when TrustedProxies is set without a header name", func() {
+			viper.Set("clientipheader.trustedproxies", "10.42.0.0/16")
+			viper.Set("clientipheader.name", " ")
+			Expect(func() { conf.Load(true) }).To(PanicWith(ContainSubstring("Name must be set")))
+		})
+
+		Describe("ParseTrustedProxies", func() {
+			It("returns nothing for an empty value", func() {
+				Expect(conf.ParseTrustedProxies(" , ")).To(BeEmpty())
+			})
+
+			It("parses a comma-separated CIDR list", func() {
+				Expect(conf.ParseTrustedProxies(" 10.42.0.0/16, fd00:42::/56 ,")).To(Equal([]netip.Prefix{
+					netip.MustParsePrefix("10.42.0.0/16"),
+					netip.MustParsePrefix("fd00:42::/56"),
+				}))
+			})
+
+			It("masks host bits", func() {
+				Expect(conf.ParseTrustedProxies("10.42.3.4/16")).To(Equal([]netip.Prefix{netip.MustParsePrefix("10.42.0.0/16")}))
+			})
+
+			DescribeTable("rejects anything but a CIDR",
+				func(value string) {
+					_, err := conf.ParseTrustedProxies(value)
+					Expect(err).To(MatchError(ContainSubstring("ClientIPHeader.TrustedProxies")))
+				},
+				Entry("a bare IP", "10.42.0.1"),
+				Entry("a bad mask", "10.42.0.0/33"),
+				Entry("a hostname", "cloudflared.web"),
+				Entry("the unix socket marker", "@"),
+			)
 		})
 	})
 

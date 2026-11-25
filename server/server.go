@@ -168,6 +168,11 @@ func (s *Server) initRoutes() {
 
 	r := chi.NewRouter()
 
+	if conf.Server.ClientIPHeader.TrustedProxies != "" {
+		log.Info("Taking the client IP from a header set by trusted proxies", "header", conf.Server.ClientIPHeader.Name,
+			"trustedProxies", conf.Server.ClientIPHeader.TrustedProxies)
+	}
+
 	defaultMiddlewares := chi.Middlewares{
 		secureMiddleware(),
 		corsHandler(),

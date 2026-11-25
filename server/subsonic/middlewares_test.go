@@ -392,6 +392,55 @@ var _ = Describe("Middlewares", func() {
 				Expect(next.called).To(BeTrue())
 			})
 
+			When("the client IP is resolved from a header set by a trusted proxy", func() {
+				// What realIPMiddleware hands on for a peer in ClientIPHeader.TrustedProxies: every
+				// request arrives from the same proxy peer, and the client IP is in the context.
+				const proxyPeer = "10.42.0.7:40000"
+				viaProxy := func(clientIP string, params ...string) *httptest.ResponseRecorder {
+					r := newGetRequest(params...)
+					r.RemoteAddr = proxyPeer
+					r.Header.Set("CF-Connecting-IP", clientIP)
+					next.called = false
+					rec := httptest.NewRecorder()
+					middleware.ClientIPFromHeader("CF-Connecting-IP")(cp).ServeHTTP(rec, r)
+					return rec
+				}
+
+				It("does not let one client's failures lock out another client", func() {
+					for range 3 {
+						Expect(viaProxy("203.0.113.1", "u=admin", "p=WRONG").Body.String()).To(ContainSubstring(`code="40"`))
+					}
+
+					viaProxy("203.0.113.1", "u=admin", "p=wordpass")
+					Expect(next.called).To(BeFalse())
+
+					viaProxy("198.51.100.2", "u=admin", "p=wordpass")
+					Expect(next.called).To(BeTrue())
+				})
+
+				It("logs the client IP, which realIPMiddleware mirrors into RemoteAddr", func() {
+					hook, cleanup := tests.LogHook()
+					DeferCleanup(cleanup)
+					remoteAddrsOf := func(msg string) []any {
+						var addrs []any
+						for _, e := range hook.AllEntries() {
+							if e.Message == msg {
+								addrs = append(addrs, e.Data["remoteAddr"])
+							}
+						}
+						return addrs
+					}
+					for range 4 {
+						r := newGetRequest("u=admin", "p=WRONG")
+						r.RemoteAddr = "203.0.113.1"
+						serve(r)
+					}
+
+					Expect(remoteAddrsOf("API: Invalid login")).To(HaveExactElements("203.0.113.1", "203.0.113.1", "203.0.113.1"))
+					Expect(remoteAddrsOf("API: Too many failed login attempts")).To(HaveExactElements("203.0.113.1"))
+				})
+			})
+
 			It("does not limit reverse proxy authentication", func() {
 				conf.Server.ExtAuth.TrustedSources = "192.168.1.1/24"
 				conf.Server.ExtAuth.UserHeader = "Remote-User"
