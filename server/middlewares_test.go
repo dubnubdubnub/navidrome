@@ -575,7 +575,71 @@ var _ = Describe("middlewares", func() {
 				Entry("an IP with a port", "203.0.113.5:443"),
 				Entry("a CIDR", "203.0.113.0/24"),
 				Entry("repeated headers", "203.0.113.5", "198.51.100.1"),
+				Entry("a zoned IP", "fe80::1%eth0"),
 			)
+
+			DescribeTable("falls back to the peer when the header IP is not public",
+				func(value string) {
+					hook, cleanup := tests.LogHook()
+					DeferCleanup(cleanup)
+					log.SetLevel(log.LevelDebug)
+
+					call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": value})
+					Expect(resolved).To(Equal("10.42.1.5"))
+					Expect(remoteAddr).To(Equal("10.42.1.5:40000"))
+					Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+					Expect(hook.LastEntry().Message).To(Equal("Ignoring non-public client IP header"))
+				},
+				Entry("loopback", "127.0.0.1"),
+				Entry("IPv6 loopback", "::1"),
+				Entry("unspecified", "0.0.0.0"),
+				Entry("IPv6 unspecified", "::"),
+				Entry("RFC 1918 10/8", "10.1.1.6"),
+				Entry("RFC 1918 172.16/12", "172.16.0.1"),
+				Entry("RFC 1918 192.168/16", "192.168.1.10"),
+				Entry("the pod CIDR", "10.42.0.9"),
+				Entry("IPv6 ULA", "fd00::1"),
+				Entry("link-local", "169.254.1.1"),
+				Entry("IPv6 link-local", "fe80::1"),
+				Entry("multicast", "224.0.0.1"),
+				Entry("broadcast", "255.255.255.255"),
+				Entry("CGNAT / Tailscale", "100.101.102.103"),
+				Entry("this network", "0.1.2.3"),
+				Entry("reserved", "240.0.0.1"),
+				Entry("v4-mapped private", "::ffff:192.168.1.10"),
+			)
+
+			It("ignores a header IP inside TrustedProxies", func() {
+				conf.Server.ClientIPHeader.TrustedProxies = "10.42.0.0/16, 198.51.100.0/24"
+				call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": "198.51.100.7"})
+				Expect(resolved).To(Equal("10.42.1.5"))
+			})
+
+			It("accepts a v4-mapped public header IP as plain IPv4", func() {
+				call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": "::ffff:203.0.113.5"})
+				Expect(resolved).To(Equal("203.0.113.5"))
+			})
+
+			It("never trusts a zoned link-local peer", func() {
+				conf.Server.ClientIPHeader.TrustedProxies = "fe80::/10"
+				call("[fe80::1%eth0]:40000", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+				Expect(resolved).To(Equal("fe80::1%eth0"))
+			})
+
+			Context("behind a loopback forwarder", func() {
+				BeforeEach(func() {
+					conf.Server.ClientIPHeader.TrustedProxies = "127.0.0.1/32"
+				})
+				It("trusts only connections from 127.0.0.1", func() {
+					call("127.0.0.1:51000", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+					Expect(resolved).To(Equal("203.0.113.5"))
+
+					for _, peer := range []string{"10.42.1.5:40000", "[::1]:51000", "127.0.0.2:51000", "100.101.102.103:443"} {
+						call(peer, map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+						Expect(resolved).ToNot(Equal("203.0.113.5"), peer)
+					}
+				})
+			})
 
 			It("logs a rejected header at debug level", func() {
 				hook, cleanup := tests.LogHook()
@@ -630,6 +694,29 @@ var _ = Describe("middlewares", func() {
 					Expect(resolved).To(Equal("198.51.100.1"))
 				})
 			})
+		})
+	})
+
+	Describe("client IP header startup log", func() {
+		logged := func(trustedProxies string) bool {
+			hook, cleanup := tests.LogHook()
+			DeferCleanup(cleanup)
+			log.SetLevel(log.LevelInfo)
+			conf.Server.ClientIPHeader.TrustedProxies = trustedProxies
+			(&Server{}).initRoutes()
+			for _, e := range hook.AllEntries() {
+				if e.Message == "Taking the client IP from a header set by trusted proxies" {
+					return true
+				}
+			}
+			return false
+		}
+		It("logs when there is a trusted proxy", func() {
+			Expect(logged("127.0.0.1/32")).To(BeTrue())
+		})
+		It("does not log when the list parses to nothing", func() {
+			Expect(logged(" , ")).To(BeFalse())
+			Expect(logged("")).To(BeFalse())
 		})
 	})
 

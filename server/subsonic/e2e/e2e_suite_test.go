@@ -409,12 +409,17 @@ func setupTestDB() {
 	ds = &tests.MockDataStore{RealDS: persistence.New(db.Db())}
 	auth.Init(ds)
 
-	// Create the Subsonic Router with real DS, streamer spy, and real Decider
+	router = newRouter()
+}
+
+// newRouter creates the Subsonic Router with the real DS, a streamer spy and the real Decider. It
+// reads conf.Server (e.g. AuthRequestLimit) as it is now.
+func newRouter() *subsonic.Router {
 	streamerSpy = &harness.SpyStreamer{}
 	decider := stream.NewTranscodeDecider(ds, harness.NoopFFmpeg{})
 	s := scanner.New(ctx, ds, events.NoopBroker(),
 		playlists.NewPlaylists(ds, artwork.NewUploader(ds)), metrics.NewNoopInstance())
-	router = subsonic.New(
+	return subsonic.New(
 		ds,
 		noopArtwork{},
 		streamerSpy,

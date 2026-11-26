@@ -55,6 +55,11 @@ func (s *Server) MountRouter(description, urlPath string, subRouter http.Handler
 	})
 }
 
+// ServeHTTP serves a request through the full route chain, as the listener started by Run does.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.router.ServeHTTP(w, r)
+}
+
 // Run starts the server with the given address, and if specified, with TLS enabled.
 func (s *Server) Run(ctx context.Context, addr string, port int, tlsCert string, tlsKey string) error {
 	// Mount the router for the frontend assets
@@ -63,7 +68,7 @@ func (s *Server) Run(ctx context.Context, addr string, port int, tlsCert string,
 	// Create a new http.Server with the specified read header timeout and handler
 	server := &http.Server{
 		ReadHeaderTimeout: consts.ServerReadHeaderTimeout,
-		Handler:           s.router,
+		Handler:           s,
 	}
 
 	// Determine if TLS is enabled
@@ -168,9 +173,9 @@ func (s *Server) initRoutes() {
 
 	r := chi.NewRouter()
 
-	if conf.Server.ClientIPHeader.TrustedProxies != "" {
+	if proxies, err := conf.ParseTrustedProxies(conf.Server.ClientIPHeader.TrustedProxies); err == nil && len(proxies) > 0 {
 		log.Info("Taking the client IP from a header set by trusted proxies", "header", conf.Server.ClientIPHeader.Name,
-			"trustedProxies", conf.Server.ClientIPHeader.TrustedProxies)
+			"trustedProxies", proxies)
 	}
 
 	defaultMiddlewares := chi.Middlewares{

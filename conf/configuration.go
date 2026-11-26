@@ -4,9 +4,9 @@ import (
 	"cmp"
 	"encoding"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
@@ -30,6 +30,7 @@ import (
 	"github.com/navidrome/navidrome/utils/run"
 	"github.com/navidrome/navidrome/utils/slice"
 	"github.com/spf13/viper"
+	"golang.org/x/net/http/httpguts"
 )
 
 type configOptions struct {
@@ -317,6 +318,7 @@ type extAuthOptions struct {
 // clientIPHeaderOptions takes the client IP from one header set by a proxy in front of Navidrome
 // (Cloudflare's CF-Connecting-IP by default), for peers in TrustedProxies only. Unlike
 // ExtAuth.TrustedSources it does not enable header login and reads no other forwarding header.
+// A peer with an IPv6 zone (a link-local connection) never matches TrustedProxies.
 type clientIPHeaderOptions struct {
 	Name           string
 	TrustedProxies string
@@ -894,11 +896,26 @@ func ParseLibraryAlbumVersions(value string) (map[string]string, error) {
 
 func validateClientIPHeader() error {
 	proxies, err := ParseTrustedProxies(Server.ClientIPHeader.TrustedProxies)
-	if err != nil {
+	if err != nil || len(proxies) == 0 {
 		return err
 	}
-	if len(proxies) > 0 && strings.TrimSpace(Server.ClientIPHeader.Name) == "" {
-		return errors.New("invalid ClientIPHeader: Name must be set when TrustedProxies is set")
+	return ValidateClientIPHeaderName(Server.ClientIPHeader.Name)
+}
+
+// clientSuppliedIPHeaders are forwarding headers that Cloudflare (and most proxies) pass through
+// from the client or append to, so a value in them can be the client's own choice.
+var clientSuppliedIPHeaders = []string{"X-Forwarded-For", "X-Real-Ip", "True-Client-Ip", "Forwarded"}
+
+// ValidateClientIPHeaderName rejects a ClientIPHeader.Name that is not an HTTP header field name
+// (an RFC 7230 token), or that names a header the client can supply.
+func ValidateClientIPHeaderName(name string) error {
+	if !httpguts.ValidHeaderFieldName(name) {
+		return fmt.Errorf("invalid ClientIPHeader.Name %q: must be an HTTP header field name (RFC 7230 token)", name)
+	}
+	canonical := http.CanonicalHeaderKey(name)
+	if slices.Contains(clientSuppliedIPHeaders, canonical) {
+		return fmt.Errorf("invalid ClientIPHeader.Name %q: clients can set or append to this header through the proxy; "+
+			"use a header the proxy always overwrites, such as CF-Connecting-IP", name)
 	}
 	return nil
 }

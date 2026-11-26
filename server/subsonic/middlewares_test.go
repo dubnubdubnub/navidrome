@@ -395,7 +395,7 @@ var _ = Describe("Middlewares", func() {
 			When("the client IP is resolved from a header set by a trusted proxy", func() {
 				// What realIPMiddleware hands on for a peer in ClientIPHeader.TrustedProxies: every
 				// request arrives from the same proxy peer, and the client IP is in the context.
-				const proxyPeer = "10.42.0.7:40000"
+				const proxyPeer = "127.0.0.1:51000" // the edge forwarder
 				viaProxy := func(clientIP string, params ...string) *httptest.ResponseRecorder {
 					r := newGetRequest(params...)
 					r.RemoteAddr = proxyPeer

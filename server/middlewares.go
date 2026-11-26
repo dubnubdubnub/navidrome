@@ -191,7 +191,7 @@ func realIPMiddleware(next http.Handler) http.Handler {
 	).Handler(mirrorClientIP(next))
 
 	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if peerInPrefixes(r, proxies) && validClientIPHeader(r, header) {
+		if peerInPrefixes(r, proxies) && validClientIPHeader(r, header, proxies) {
 			fromHeader.ServeHTTP(w, r)
 			return
 		}
@@ -229,20 +229,34 @@ func forwardedIPMiddleware(next http.Handler) http.Handler {
 	return reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr })(dispatch)
 }
 
-// peerInPrefixes reports whether the TCP peer is inside one of the prefixes. A unix socket peer never is.
+// peerInPrefixes reports whether the TCP peer is inside one of the prefixes. A unix socket peer never
+// is, and neither is a peer with an IPv6 zone (a link-local connection): netip.Prefix.Contains never
+// matches a zoned address.
 func peerInPrefixes(r *http.Request, prefixes []netip.Prefix) bool {
 	ip, err := netip.ParseAddr(peerHost(r))
 	if err != nil {
 		return false
 	}
-	ip = ip.Unmap()
+	return inPrefixes(ip.Unmap(), prefixes)
+}
+
+func inPrefixes(ip netip.Addr, prefixes []netip.Prefix) bool {
 	return slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(ip) })
 }
 
-// validClientIPHeader reports whether the header holds exactly one value, and that value is one IP.
-// Anything else falls back to the peer: the proxy sets this header itself, so a list or a malformed
-// value means something other than that proxy wrote it.
-func validClientIPHeader(r *http.Request, header string) bool {
+// nonPublicPrefixes are not reachable from the internet, on top of what netip classifies as
+// loopback, link-local, multicast, unspecified or private (RFC 1918 / ULA).
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),     // "this network"
+	netip.MustParsePrefix("100.64.0.0/10"), // shared address space (CGNAT, Tailscale)
+	netip.MustParsePrefix("240.0.0.0/4"),   // reserved
+}
+
+// validClientIPHeader reports whether the header holds exactly one value, and that value is one
+// public IP. Anything else falls back to the peer: the proxy sets this header to the internet
+// client's address, so a list, a malformed value or a non-public address (loopback, private, a
+// trusted proxy's own range...) means something other than that proxy wrote it.
+func validClientIPHeader(r *http.Request, header string, proxies []netip.Prefix) bool {
 	values := r.Header.Values(header)
 	switch {
 	case len(values) == 0:
@@ -251,8 +265,14 @@ func validClientIPHeader(r *http.Request, header string) bool {
 		log.Debug(r.Context(), "Ignoring client IP header with more than one value", "header", header, "values", values, "peer", r.RemoteAddr)
 		return false
 	}
-	if _, err := netip.ParseAddr(values[0]); err != nil {
+	ip, err := netip.ParseAddr(values[0])
+	if err != nil || ip.Zone() != "" {
 		log.Debug(r.Context(), "Ignoring malformed client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
+		return false
+	}
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || inPrefixes(ip, nonPublicPrefixes) || inPrefixes(ip, proxies) {
+		log.Debug(r.Context(), "Ignoring non-public client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
 		return false
 	}
 	return true
