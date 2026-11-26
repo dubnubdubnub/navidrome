@@ -3,4 +3,17 @@ kind: Service
 metadata: { name: navidrome, labels: { app: navidrome } }
 spec:
   selector: { app: navidrome }
-  ports: [{ port: 4533, targetPort: 4533 }]
+  # `edge` (4535) is the Cloudflare Tunnel's port: the pod's socat sidecar forwards it to
+  # 127.0.0.1:4533, and Navidrome trusts CF-Connecting-IP only from 127.0.0.1
+  # (ND_CLIENTIPHEADER_TRUSTEDPROXIES in configmap.yaml). Only cloudflared may reach it (infra
+  # NetworkPolicy). Everything else (the tailnet Ingress, in-cluster callers) uses `http` (4533),
+  # where the client IP is the TCP peer.
+  #
+  # publishNotReadyAddresses: the pod is Ready only while EVERY container runs, so a
+  # crash-looping sidecar would otherwise pull the pod out of the endpoints and take the tailnet
+  # path down with the tunnel. Nothing is lost: navidrome has no readiness probe (Ready = running),
+  # and with one replica and Recreate there is no other endpoint to fail over to.
+  publishNotReadyAddresses: true
+  ports:
+    - { name: http, port: 4533, targetPort: http }
+    - { name: edge, port: 4535, targetPort: edge }

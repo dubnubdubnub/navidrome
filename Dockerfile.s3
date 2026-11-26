@@ -21,7 +21,8 @@ RUN CGO_ENABLED=1 go build -tags=netgo,sqlite_fts5 -o /out/navidrome .
 ########################################################################################################################
 ### Final runtime image.
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+# socat: the `edge` sidecar in deploy/deployment.yaml (a loopback forwarder for the tunnel port).
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates socat && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/navidrome /usr/bin/navidrome
 EXPOSE 4533
 ENTRYPOINT ["/usr/bin/navidrome"]
