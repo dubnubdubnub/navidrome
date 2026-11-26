@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -170,10 +172,42 @@ func clientUniqueIDMiddleware(next http.Handler) http.Handler {
 
 // realIPMiddleware resolves the request's client IP into the context, where it can be read with
 // middleware.GetClientIP, and mirrors it into RemoteAddr for logging and player registration.
-// Forwarding headers are only honoured when the peer is listed in ExtAuth.TrustedSources, so that
+// A client IP header (ClientIPHeader) is only honoured when the peer is in ClientIPHeader.TrustedProxies,
+// and other forwarding headers only when the peer is listed in ExtAuth.TrustedSources, so that
 // a client cannot pick its own identity and evade controls keyed on it. The peer address is kept
 // in the context as request.ReverseProxyIp.
 func realIPMiddleware(next http.Handler) http.Handler {
+	fromForwarding := forwardedIPMiddleware(next)
+	proxies, err := conf.ParseTrustedProxies(conf.Server.ClientIPHeader.TrustedProxies)
+	if err != nil {
+		panic(err) // conf.Load validates it, so this is a programming error
+	}
+	if len(proxies) == 0 {
+		return fromForwarding
+	}
+	header := http.CanonicalHeaderKey(conf.Server.ClientIPHeader.Name)
+	fromHeader := chi.Chain(
+		middleware.ClientIPFromRemoteAddr,
+		middleware.ClientIPFromHeader(header),
+	).Handler(mirrorClientIP(next))
+
+	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if peerInPrefixes(r, proxies) {
+			problem := clientIPHeaderProblem(r, header, proxies)
+			if problem == "" {
+				fromHeader.ServeHTTP(w, r)
+				return
+			}
+			clientIPFallbackWarner.warn(r.Context(), header, problem, r.RemoteAddr)
+		}
+		fromForwarding.ServeHTTP(w, r)
+	})
+	return reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr })(dispatch)
+}
+
+// forwardedIPMiddleware resolves the client IP from the peer, or from the forwarding headers when the
+// peer is listed in ExtAuth.TrustedSources.
+func forwardedIPMiddleware(next http.Handler) http.Handler {
 	trusted := conf.Server.ExtAuth.TrustedSources
 	fromPeer := middleware.ClientIPFromRemoteAddr(next)
 	if trusted == "" {
@@ -198,6 +232,86 @@ func realIPMiddleware(next http.Handler) http.Handler {
 		fromPeer.ServeHTTP(w, r)
 	})
 	return reqToCtx(request.ReverseProxyIp, func(r *http.Request) any { return r.RemoteAddr })(dispatch)
+}
+
+// peerInPrefixes reports whether the TCP peer is inside one of the prefixes. A unix socket peer never
+// is, and neither is a peer with an IPv6 zone (a link-local connection): netip.Prefix.Contains never
+// matches a zoned address.
+func peerInPrefixes(r *http.Request, prefixes []netip.Prefix) bool {
+	ip, err := netip.ParseAddr(peerHost(r))
+	if err != nil {
+		return false
+	}
+	return inPrefixes(ip.Unmap(), prefixes)
+}
+
+func inPrefixes(ip netip.Addr, prefixes []netip.Prefix) bool {
+	return slices.ContainsFunc(prefixes, func(p netip.Prefix) bool { return p.Contains(ip) })
+}
+
+// nonPublicPrefixes are not reachable from the internet, on top of what netip classifies as
+// loopback, link-local, multicast, unspecified or private (RFC 1918 / ULA).
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),     // "this network"
+	netip.MustParsePrefix("100.64.0.0/10"), // shared address space (CGNAT, Tailscale)
+	netip.MustParsePrefix("240.0.0.0/4"),   // reserved
+}
+
+// clientIPHeaderProblem returns "" when the header holds exactly one value, and that value is one
+// public IP, and otherwise what is wrong with it. Anything else falls back to the peer: the proxy
+// sets this header to the internet client's address, so a missing header, a list, a malformed value
+// or a non-public address (loopback, private, a trusted proxy's own range...) means something
+// other than that proxy wrote it, or the proxy stopped sending it.
+func clientIPHeaderProblem(r *http.Request, header string, proxies []netip.Prefix) string {
+	values := r.Header.Values(header)
+	switch {
+	case len(values) == 0:
+		log.Debug(r.Context(), "Trusted proxy sent no client IP header", "header", header, "peer", r.RemoteAddr)
+		return "missing"
+	case len(values) > 1:
+		log.Debug(r.Context(), "Ignoring client IP header with more than one value", "header", header, "values", values, "peer", r.RemoteAddr)
+		return "more than one value"
+	}
+	ip, err := netip.ParseAddr(values[0])
+	if err != nil || ip.Zone() != "" {
+		log.Debug(r.Context(), "Ignoring malformed client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
+		return "malformed"
+	}
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || inPrefixes(ip, nonPublicPrefixes) || inPrefixes(ip, proxies) {
+		log.Debug(r.Context(), "Ignoring non-public client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
+		return "not a public IP"
+	}
+	return ""
+}
+
+// clientIPFallbackWarner reports, at most once a minute, that a trusted proxy sent no usable client
+// IP header. Every such request is keyed on the proxy's own address, so all of them share one login
+// limiter bucket: a proxy-side change (e.g. Cloudflare removing visitor IP headers, or Pseudo IPv4
+// rewriting them into 240.0.0.0/4) must not go unnoticed at the default log level.
+var clientIPFallbackWarner = &rateLimitedWarner{every: time.Minute, now: time.Now}
+
+type rateLimitedWarner struct {
+	every      time.Duration
+	now        func() time.Time
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+func (rw *rateLimitedWarner) warn(ctx context.Context, header, problem, peer string) {
+	rw.mu.Lock()
+	now := rw.now()
+	if !rw.last.IsZero() && now.Sub(rw.last) < rw.every {
+		rw.suppressed++
+		rw.mu.Unlock()
+		return
+	}
+	suppressed := rw.suppressed
+	rw.last, rw.suppressed = now, 0
+	rw.mu.Unlock()
+	log.Warn(ctx, "Trusted proxy sent no usable client IP header; using the proxy's address as the client IP",
+		"header", header, "problem", problem, "peer", peer, "suppressedSinceLastWarning", suppressed)
 }
 
 // mirrorClientIP copies the resolved client IP into RemoteAddr when it differs from the peer.

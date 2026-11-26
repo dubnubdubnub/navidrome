@@ -9,6 +9,34 @@ data:
   # navidrome egress NetworkPolicy (infra gitops/music-netpol) would not stop it,
   # because it allows public :443 for the metadata agents.
   ND_ENABLEINSIGHTSCOLLECTOR: "false"
+  # Per-client login limiting behind the tunnel (PR #18, ClientIPHeader). Without it every
+  # internet client reaches Navidrome from a cloudflared pod and shares ONE Subsonic
+  # failed-login bucket per username (anyone could lock anyone out), and auth-failure logs show
+  # the pod, not the client. With it, a request whose TCP peer is 127.0.0.1 and that carries
+  # exactly one public CF-Connecting-IP uses that IP as the client IP (every login limiter's key,
+  # the logged remoteAddr, player IPs). It does NOT enable header login and reads no other
+  # forwarding header; never use ND_EXTAUTH_TRUSTEDSOURCES for this (it turns on Remote-User login).
+  #
+  # 127.0.0.1 is ONLY the `edge` sidecar (deployment.yaml), which forwards Service port `edge`
+  # (4535) to 127.0.0.1:4533, and only cloudflared may reach 4535 (infra NetworkPolicy). Internet
+  # clients cannot choose the value: Cloudflare sets CF-Connecting-IP to the connecting client's
+  # IP on edge-to-origin traffic. Everyone else (the tailnet Ingress, whose Serve proxy copies
+  # client headers verbatim; music-web; music-ingest; the checks; kubelet probes) connects to 4533
+  # from a pod or node IP, so the header is ignored and the TCP peer stays the client IP.
+  # Other loopback peers, all admin-only: `kubectl exec` / `kubectl port-forward` into the pod and
+  # ephemeral debug containers can also connect from 127.0.0.1 and pick a header IP. Also,
+  # kube-router admits the pod's own node (host netns) to podIP:4535 (low impact: node root).
+  # Do NOT widen this to the pod CIDR: that would let any tailnet device rotate the header past
+  # every login limiter. ND_CLIENTIPHEADER_NAME stays at its default, CF-Connecting-IP.
+  #
+  # Cloudflare settings this depends on (zone dubnubdubnub.com):
+  #   * Network > Pseudo IPv4 must stay "Off" or "Add header". "Overwrite headers" replaces
+  #     CF-Connecting-IP with a 240.0.0.0/4 pseudo address, which Navidrome rejects.
+  #   * The "Remove visitor IP headers" Managed Transform must stay off (it drops the header).
+  # Either one sends every tunnel client back to ONE shared login bucket (127.0.0.1). Navidrome
+  # then logs, at most once a minute, the Warn "Trusted proxy sent no usable client IP header"
+  # with the problem and a count; alert on that line.
+  ND_CLIENTIPHEADER_TRUSTEDPROXIES: 127.0.0.1/32
   ND_IMAGECACHESIZE: 500MB
   ND_LOGLEVEL: info
   ND_MUSICFOLDER: s3://music

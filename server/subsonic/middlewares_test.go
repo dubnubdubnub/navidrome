@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/conf/configtest"
 	"github.com/navidrome/navidrome/consts"
@@ -391,6 +392,55 @@ var _ = Describe("Middlewares", func() {
 				Expect(next.called).To(BeTrue())
 			})
 
+			When("the client IP is resolved from a header set by a trusted proxy", func() {
+				// What realIPMiddleware hands on for a peer in ClientIPHeader.TrustedProxies: every
+				// request arrives from the same proxy peer, and the client IP is in the context.
+				const proxyPeer = "127.0.0.1:51000" // the edge forwarder
+				viaProxy := func(clientIP string, params ...string) *httptest.ResponseRecorder {
+					r := newGetRequest(params...)
+					r.RemoteAddr = proxyPeer
+					r.Header.Set("CF-Connecting-IP", clientIP)
+					next.called = false
+					rec := httptest.NewRecorder()
+					middleware.ClientIPFromHeader("CF-Connecting-IP")(cp).ServeHTTP(rec, r)
+					return rec
+				}
+
+				It("does not let one client's failures lock out another client", func() {
+					for range 3 {
+						Expect(viaProxy("203.0.113.1", "u=admin", "p=WRONG").Body.String()).To(ContainSubstring(`code="40"`))
+					}
+
+					viaProxy("203.0.113.1", "u=admin", "p=wordpass")
+					Expect(next.called).To(BeFalse())
+
+					viaProxy("198.51.100.2", "u=admin", "p=wordpass")
+					Expect(next.called).To(BeTrue())
+				})
+
+				It("logs the client IP, which realIPMiddleware mirrors into RemoteAddr", func() {
+					hook, cleanup := tests.LogHook()
+					DeferCleanup(cleanup)
+					remoteAddrsOf := func(msg string) []any {
+						var addrs []any
+						for _, e := range hook.AllEntries() {
+							if e.Message == msg {
+								addrs = append(addrs, e.Data["remoteAddr"])
+							}
+						}
+						return addrs
+					}
+					for range 4 {
+						r := newGetRequest("u=admin", "p=WRONG")
+						r.RemoteAddr = "203.0.113.1"
+						serve(r)
+					}
+
+					Expect(remoteAddrsOf("API: Invalid login")).To(HaveExactElements("203.0.113.1", "203.0.113.1", "203.0.113.1"))
+					Expect(remoteAddrsOf("API: Too many failed login attempts")).To(HaveExactElements("203.0.113.1"))
+				})
+			})
+
 			It("does not limit reverse proxy authentication", func() {
 				conf.Server.ExtAuth.TrustedSources = "192.168.1.1/24"
 				conf.Server.ExtAuth.UserHeader = "Remote-User"
@@ -517,6 +567,40 @@ var _ = Describe("Middlewares", func() {
 
 			cookieStr := w.Header().Get("Set-Cookie")
 			Expect(cookieStr).To(ContainSubstring(playerIDCookieName("someone")))
+		})
+
+		It("registers the player with the client IP from RemoteAddr", func() {
+			r.RemoteAddr = "192.0.2.10:54321"
+			gp := middleware.ClientIPFromRemoteAddr(getPlayer(mockedPlayers)(next))
+			gp.ServeHTTP(w, r)
+
+			Expect(mockedPlayers.ip).To(Equal("192.0.2.10"))
+		})
+
+		It("keeps the client IP when RemoteAddr has no port, as set behind a trusted proxy", func() {
+			r.RemoteAddr = "192.0.2.10"
+			gp := middleware.ClientIPFromRemoteAddr(getPlayer(mockedPlayers)(next))
+			gp.ServeHTTP(w, r)
+
+			Expect(mockedPlayers.ip).To(Equal("192.0.2.10"))
+		})
+
+		It("takes the client IP resolved into the context, not the peer address", func() {
+			// realIPMiddleware resolves forwarding headers from a trusted proxy the same way
+			r.RemoteAddr = "10.0.0.1:1234"
+			r.Header.Set("X-Real-IP", "203.0.113.6")
+			gp := middleware.ClientIPFromHeader("X-Real-IP")(getPlayer(mockedPlayers)(next))
+			gp.ServeHTTP(w, r)
+
+			Expect(mockedPlayers.ip).To(Equal("203.0.113.6"))
+		})
+
+		It("does not take a unix socket peer for an IP", func() {
+			r.RemoteAddr = "@"
+			gp := middleware.ClientIPFromRemoteAddr(getPlayer(mockedPlayers)(next))
+			gp.ServeHTTP(w, r)
+
+			Expect(mockedPlayers.ip).To(BeEmpty())
 		})
 
 		It("does not add the cookie if there was an error", func() {
@@ -710,6 +794,7 @@ func (mh *mockHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type mockPlayers struct {
 	core.Players
 	transcoding *model.Transcoding
+	ip          string
 }
 
 func (mp *mockPlayers) Get(ctx context.Context, playerId string) (*model.Player, error) {
@@ -717,6 +802,7 @@ func (mp *mockPlayers) Get(ctx context.Context, playerId string) (*model.Player,
 }
 
 func (mp *mockPlayers) Register(ctx context.Context, id, client, typ, ip string) (*model.Player, *model.Transcoding, error) {
+	mp.ip = ip
 	if client == "error" {
 		return nil, nil, errors.New(client)
 	}

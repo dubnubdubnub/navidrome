@@ -1,13 +1,17 @@
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: navidrome }
+metadata:
+  name: navidrome
+  # Golden rule 3: one RWO PVC (navidrome-data: the SQLite DB) + Recreate. Kyverno
+  # restrict-single-writer-replicas denies replicas > 1 (and scaling above 1) for this label.
+  labels: { app: navidrome, dubcluster.io/single-writer: "true" }
 spec:
   replicas: 1
   selector: { matchLabels: { app: navidrome } }
   strategy: { type: Recreate }
   template:
     metadata:
-      labels: { app: navidrome }
+      labels: { app: navidrome, dubcluster.io/single-writer: "true" }
       annotations:
         # Bump this whenever deploy/configmap.yaml changes.
         #
@@ -33,7 +37,9 @@ spec:
         # at every boot and the library only ever scanned on startup.
         # 3 = ND_ENABLEINSIGHTSCOLLECTOR=false (2026-10-28).
         # 4 = ND_SCANNER_LIBRARYALBUMVERSIONS for the Hi-Res library (2026-11-05).
-        config.navidrome.dubnubdubnub.com/revision: "4"
+        # 5 = ND_CLIENTIPHEADER_TRUSTEDPROXIES=127.0.0.1/32 + the `edge` sidecar, per-client
+        #     login limiting behind the tunnel; single-writer label (PR #18, 2026-11-25).
+        config.navidrome.dubnubdubnub.com/revision: "5"
     spec:
       imagePullSecrets:
         - { name: ghcr-pull }
@@ -47,7 +53,7 @@ spec:
         - name: navidrome
           image: ghcr.io/dubnubdubnub/navidrome-s3 # tag set by kustomize (CI write-back)
           imagePullPolicy: IfNotPresent
-          ports: [{ containerPort: 4533 }]
+          ports: [{ name: http, containerPort: 4533 }]
           envFrom:
             - configMapRef: { name: navidrome-config }
           env:
@@ -58,6 +64,50 @@ spec:
             limits: { memory: 1Gi }
           volumeMounts:
             - { name: data, mountPath: /data }
+        # The Cloudflare Tunnel's way in (Service port `edge`). A plain TCP forwarder to
+        # 127.0.0.1:4533, so Navidrome sees these connections, and only these, from 127.0.0.1:
+        # the one peer ND_CLIENTIPHEADER_TRUSTEDPROXIES trusts to send CF-Connecting-IP. Same
+        # image as navidrome (socat is installed in Dockerfile.s3), so it shares the pinned tag.
+        #
+        # If it dies, only the tunnel (/rest) gets connection refused; the tailnet Ingress and
+        # in-cluster callers use 4533 directly (see publishNotReadyAddresses in service.yaml).
+        #
+        # Options (socat 1.7.4, bookworm; names checked against its xioopts.c / socat.yo):
+        #   fork, max-children=256  one child per connection (a streaming client or a cloudflared
+        #                           keep-alive connection), at most 256 at once.
+        #   backlog=128             listen() queue; socat's default is 5.
+        #   keepalive, keepidle=60, keepintvl=15, keepcnt=4  on both sides: a cloudflared peer that
+        #                           vanishes without a FIN (node crash, partition) is dropped after
+        #                           ~2 min of silence instead of holding a child forever. Without it
+        #                           dead connections pile up to max-children, socat stops accepting
+        #                           and /rest fails while the tcpSocket liveness probe (which only
+        #                           needs the kernel to complete the handshake) still passes.
+        #   nodelay                 no Nagle delay on small API responses.
+        # Memory: NOT measured (no socat runtime where this was written). A forked socat child is
+        # typically well under 1 MiB of private memory, so 256 children fit in 256Mi with headroom.
+        - name: edge
+          image: ghcr.io/dubnubdubnub/navidrome-s3 # tag set by kustomize (CI write-back)
+          imagePullPolicy: IfNotPresent
+          command:
+            - socat
+            - TCP4-LISTEN:4535,fork,reuseaddr,nodelay,keepalive,keepidle=60,keepintvl=15,keepcnt=4,backlog=128,max-children=256
+            - TCP4:127.0.0.1:4533,nodelay,keepalive,keepidle=60,keepintvl=15,keepcnt=4
+          ports: [{ name: edge, containerPort: 4535 }]
+          livenessProbe:
+            tcpSocket: { port: edge }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+            seccompProfile: { type: RuntimeDefault }
       volumes:
         - name: data
           persistentVolumeClaim: { claimName: navidrome-data }
