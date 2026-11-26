@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -191,9 +192,13 @@ func realIPMiddleware(next http.Handler) http.Handler {
 	).Handler(mirrorClientIP(next))
 
 	dispatch := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if peerInPrefixes(r, proxies) && validClientIPHeader(r, header, proxies) {
-			fromHeader.ServeHTTP(w, r)
-			return
+		if peerInPrefixes(r, proxies) {
+			problem := clientIPHeaderProblem(r, header, proxies)
+			if problem == "" {
+				fromHeader.ServeHTTP(w, r)
+				return
+			}
+			clientIPFallbackWarner.warn(r.Context(), header, problem, r.RemoteAddr)
 		}
 		fromForwarding.ServeHTTP(w, r)
 	})
@@ -252,30 +257,61 @@ var nonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),   // reserved
 }
 
-// validClientIPHeader reports whether the header holds exactly one value, and that value is one
-// public IP. Anything else falls back to the peer: the proxy sets this header to the internet
-// client's address, so a list, a malformed value or a non-public address (loopback, private, a
-// trusted proxy's own range...) means something other than that proxy wrote it.
-func validClientIPHeader(r *http.Request, header string, proxies []netip.Prefix) bool {
+// clientIPHeaderProblem returns "" when the header holds exactly one value, and that value is one
+// public IP, and otherwise what is wrong with it. Anything else falls back to the peer: the proxy
+// sets this header to the internet client's address, so a missing header, a list, a malformed value
+// or a non-public address (loopback, private, a trusted proxy's own range...) means something
+// other than that proxy wrote it, or the proxy stopped sending it.
+func clientIPHeaderProblem(r *http.Request, header string, proxies []netip.Prefix) string {
 	values := r.Header.Values(header)
 	switch {
 	case len(values) == 0:
-		return false
+		log.Debug(r.Context(), "Trusted proxy sent no client IP header", "header", header, "peer", r.RemoteAddr)
+		return "missing"
 	case len(values) > 1:
 		log.Debug(r.Context(), "Ignoring client IP header with more than one value", "header", header, "values", values, "peer", r.RemoteAddr)
-		return false
+		return "more than one value"
 	}
 	ip, err := netip.ParseAddr(values[0])
 	if err != nil || ip.Zone() != "" {
 		log.Debug(r.Context(), "Ignoring malformed client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
-		return false
+		return "malformed"
 	}
 	ip = ip.Unmap()
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() || inPrefixes(ip, nonPublicPrefixes) || inPrefixes(ip, proxies) {
 		log.Debug(r.Context(), "Ignoring non-public client IP header", "header", header, "value", values[0], "peer", r.RemoteAddr)
-		return false
+		return "not a public IP"
 	}
-	return true
+	return ""
+}
+
+// clientIPFallbackWarner reports, at most once a minute, that a trusted proxy sent no usable client
+// IP header. Every such request is keyed on the proxy's own address, so all of them share one login
+// limiter bucket: a proxy-side change (e.g. Cloudflare removing visitor IP headers, or Pseudo IPv4
+// rewriting them into 240.0.0.0/4) must not go unnoticed at the default log level.
+var clientIPFallbackWarner = &rateLimitedWarner{every: time.Minute, now: time.Now}
+
+type rateLimitedWarner struct {
+	every      time.Duration
+	now        func() time.Time
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+func (rw *rateLimitedWarner) warn(ctx context.Context, header, problem, peer string) {
+	rw.mu.Lock()
+	now := rw.now()
+	if !rw.last.IsZero() && now.Sub(rw.last) < rw.every {
+		rw.suppressed++
+		rw.mu.Unlock()
+		return
+	}
+	suppressed := rw.suppressed
+	rw.last, rw.suppressed = now, 0
+	rw.mu.Unlock()
+	log.Warn(ctx, "Trusted proxy sent no usable client IP header; using the proxy's address as the client IP",
+		"header", header, "problem", problem, "peer", peer, "suppressedSinceLastWarning", suppressed)
 }
 
 // mirrorClientIP copies the resolved client IP into RemoteAddr when it differs from the peer.

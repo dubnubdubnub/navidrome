@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,6 +23,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 var _ = Describe("middlewares", func() {
@@ -507,10 +509,24 @@ var _ = Describe("middlewares", func() {
 		})
 
 		Context("with a client IP header", func() {
+			var clock time.Time
 			BeforeEach(func() {
 				conf.Server.ClientIPHeader.Name = "CF-Connecting-IP"
 				conf.Server.ClientIPHeader.TrustedProxies = "10.42.0.0/16"
+				saved := clientIPFallbackWarner
+				clock = time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+				clientIPFallbackWarner = &rateLimitedWarner{every: time.Minute, now: func() time.Time { return clock }}
+				DeferCleanup(func() { clientIPFallbackWarner = saved })
 			})
+			entries := func(hook *logtest.Hook, level logrus.Level, message string) []*logrus.Entry {
+				var found []*logrus.Entry
+				for _, e := range hook.AllEntries() {
+					if e.Level == level && strings.Contains(e.Message, message) {
+						found = append(found, e)
+					}
+				}
+				return found
+			}
 
 			It("uses the header IP when the peer is a trusted proxy", func() {
 				call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
@@ -587,8 +603,7 @@ var _ = Describe("middlewares", func() {
 					call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": value})
 					Expect(resolved).To(Equal("10.42.1.5"))
 					Expect(remoteAddr).To(Equal("10.42.1.5:40000"))
-					Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
-					Expect(hook.LastEntry().Message).To(Equal("Ignoring non-public client IP header"))
+					Expect(entries(hook, logrus.DebugLevel, "Ignoring non-public client IP header")).To(HaveLen(1))
 				},
 				Entry("loopback", "127.0.0.1"),
 				Entry("IPv6 loopback", "::1"),
@@ -647,13 +662,64 @@ var _ = Describe("middlewares", func() {
 				log.SetLevel(log.LevelDebug)
 
 				callWith("10.42.1.5:40000", http.Header{"Cf-Connecting-Ip": {"203.0.113.5", "198.51.100.1"}})
-				Expect(hook.LastEntry()).ToNot(BeNil())
-				Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
-				Expect(hook.LastEntry().Message).To(ContainSubstring("more than one value"))
+				Expect(entries(hook, logrus.DebugLevel, "more than one value")).To(HaveLen(1))
 
 				callWith("10.42.1.5:40000", http.Header{"Cf-Connecting-Ip": {"not-an-ip"}})
-				Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
-				Expect(hook.LastEntry().Message).To(ContainSubstring("malformed"))
+				Expect(entries(hook, logrus.DebugLevel, "malformed")).To(HaveLen(1))
+			})
+
+			Describe("falling back from a trusted proxy", func() {
+				const warning = "Trusted proxy sent no usable client IP header"
+				var hook *logtest.Hook
+				BeforeEach(func() {
+					var cleanup func()
+					hook, cleanup = tests.LogHook() // Warn level, as in production at info
+					DeferCleanup(cleanup)
+				})
+
+				DescribeTable("warns when a trusted proxy sends no usable header",
+					func(problem string, values ...string) {
+						h := http.Header{}
+						for _, v := range values {
+							h.Add("CF-Connecting-IP", v)
+						}
+						callWith("10.42.1.5:40000", h)
+						Expect(resolved).To(Equal("10.42.1.5"))
+						warns := entries(hook, logrus.WarnLevel, warning)
+						Expect(warns).To(HaveLen(1))
+						Expect(warns[0].Data).To(HaveKeyWithValue("problem", problem))
+						Expect(warns[0].Data).To(HaveKeyWithValue("peer", "10.42.1.5:40000"))
+						Expect(warns[0].Data).To(HaveKeyWithValue("header", "Cf-Connecting-Ip"))
+					},
+					Entry("missing (e.g. Remove visitor IP headers)", "missing"),
+					Entry("Pseudo IPv4 = Overwrite Headers (240.0.0.0/4)", "not a public IP", "240.16.0.1"),
+					Entry("malformed", "malformed", "garbage"),
+					Entry("repeated", "more than one value", "203.0.113.5", "198.51.100.1"),
+				)
+
+				It("warns at most once a minute, then reports how many it held back", func() {
+					for range 3 {
+						call("10.42.1.5:40000", nil)
+					}
+					Expect(entries(hook, logrus.WarnLevel, warning)).To(HaveLen(1))
+
+					clock = clock.Add(59 * time.Second)
+					call("10.42.1.5:40000", nil)
+					Expect(entries(hook, logrus.WarnLevel, warning)).To(HaveLen(1))
+
+					clock = clock.Add(time.Second)
+					call("10.42.1.5:40000", nil)
+					warns := entries(hook, logrus.WarnLevel, warning)
+					Expect(warns).To(HaveLen(2))
+					Expect(warns[1].Data).To(HaveKeyWithValue("suppressedSinceLastWarning", 3))
+				})
+
+				It("does not warn for a usable header or an untrusted peer", func() {
+					call("10.42.1.5:40000", map[string]string{"CF-Connecting-IP": "203.0.113.5"})
+					call("198.51.100.9:1234", nil)
+					call("198.51.100.9:1234", map[string]string{"CF-Connecting-IP": "garbage"})
+					Expect(entries(hook, logrus.WarnLevel, warning)).To(BeEmpty())
+				})
 			})
 
 			It("reads a custom header name", func() {
